@@ -98,16 +98,12 @@ class PortfolioEngine(BaseEngine):
         trade.reference = reference
         self.event_engine.put(Event(EVENT_PM_TRADE, trade))
 
-        # 自动订阅tick数据
-        if trade.vt_symbol in self.subscribed:
-            return
-
-        contract: ContractData | None = self.main_engine.get_contract(trade.vt_symbol)
-        if not contract:
-            return
-
-        req: SubscribeRequest = SubscribeRequest(contract.symbol, contract.exchange)
-        self.main_engine.subscribe(req, contract.gateway_name)
+        # 有持仓的合约才需要订阅tick数据
+        if self.has_position(vt_symbol):
+            self.result_symbols.add(vt_symbol)
+            self.subscribe_symbol(vt_symbol)
+        else:
+            self.result_symbols.discard(vt_symbol)
 
     def process_timer_event(self, event: Event) -> None:
         """"""
@@ -140,10 +136,30 @@ class PortfolioEngine(BaseEngine):
         if contract.vt_symbol not in self.result_symbols:
             return
 
+        self.subscribe_symbol(contract.vt_symbol)
+
+    def subscribe_symbol(self, vt_symbol: str) -> None:
+        """订阅合约行情，自动去重"""
+        if vt_symbol in self.subscribed:
+            return
+
+        contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+        if not contract:
+            return
+
         req: SubscribeRequest = SubscribeRequest(contract.symbol, contract.exchange)
         self.main_engine.subscribe(req, contract.gateway_name)
 
-        self.subscribed.add(contract.vt_symbol)
+        # 记录已订阅：CTP等接口不支持退订，重复调用只会产生冗余请求
+        self.subscribed.add(vt_symbol)
+
+    def has_position(self, vt_symbol: str) -> bool:
+        """检查合约是否还有持仓（同一合约可能同时被多个组合持有）"""
+        return any(
+            contract_result.last_pos
+            for contract_result in self.contract_results.values()
+            if contract_result.vt_symbol == vt_symbol
+        )
 
     def load_data(self) -> None:
         """"""
@@ -164,7 +180,10 @@ class PortfolioEngine(BaseEngine):
                 pos = d["last_pos"]
                 date_changed = True
 
-            self.result_symbols.add(vt_symbol)
+            # 只有仍有持仓的合约才需要订阅行情
+            if pos:
+                self.result_symbols.add(vt_symbol)
+
             self.contract_results[(reference, vt_symbol)] = ContractResult(
                 self,
                 reference,

@@ -8,21 +8,15 @@ if TYPE_CHECKING:
     from .engine import PortfolioEngine
 
 
-# 夜盘开盘前换日：20:00 之后归属下一个交易日
-NIGHT_SESSION_HOUR: int = 20
-
-
 def get_trading_day(now: datetime | None = None) -> str:
-    """取交易日（国内期货惯例：夜盘算下一个交易日）
+    """取交易日：按**自然日**，遇周六日顺延到周一（没有节假日日历，长假只能近似）
 
-    - 20:00 之后算下一个自然日（夜盘 21:00 开盘前换日）
-    - 遇周六日顺延到周一（没有节假日日历，长假只能近似）
+    本地以 A 股为主，而 A 股没有夜盘，所以不再把 20:00 之后算作下一个交易日：
+    那条期货夜盘口径会让当天 20:00 过后的“数据日期”跳到次日（同时把当日盈亏
+    也计到次日名下）。若以后要跑期货夜盘，需要把 20:00 换日的逻辑加回来，
+    否则一夜的行情会被拆成两个快照点。
     """
-    current: datetime = now or datetime.now()
-
-    day: date = current.date()
-    if current.hour >= NIGHT_SESSION_HOUR:
-        day += timedelta(days=1)
+    day: date = (now or datetime.now()).date()
 
     while day.weekday() >= 5:
         day += timedelta(days=1)

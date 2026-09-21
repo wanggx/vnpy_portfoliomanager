@@ -309,7 +309,12 @@ class PortfolioEngine(BaseEngine):
         save_json(self.history_filename, data)
 
     def save_history_periodically(self) -> None:
-        """按时间间隔落盘历史快照与仓位，避免崩溃丢当日数据"""
+        """按时间间隔落盘历史快照、仓位与委托映射，避免崩溃丢当日数据
+
+        委托映射（order_reference_map）必须一起落盘：成交记录与当日成交回放都靠它把
+        成交归到组合上，而 load_order 只在文件日期等于当前交易日时才加载。只在 close()
+        里存的话，进程非正常退出就整份丢失，表现就是成交记录为空、回放失效。
+        """
         self.history_save_seconds += self.timer_interval
         if self.history_save_seconds < self.history_save_interval:
             return
@@ -317,6 +322,7 @@ class PortfolioEngine(BaseEngine):
         self.history_save_seconds = 0
         self.save_history()
         self.save_data()
+        self.save_order()
 
     def record_daily_result(self, date_str: str) -> None:
         """记录指定日期的盈亏快照，同一日期重复调用会覆盖（未计算过盈亏时跳过）"""
@@ -365,8 +371,8 @@ class PortfolioEngine(BaseEngine):
     def check_date_change(self) -> None:
         """检测交易日切换：归档前一日结果，并把收盘仓位滚动为新的开盘仓位
 
-        交易日按国内期货惯例：20:00 之后的夜盘归属下一个交易日，
-        因此一夜的行情不会被拆成两个快照点。
+        交易日按自然日（遇周末顺延），本地以 A 股为主、没有夜盘，所以不再把 20:00
+        之后算作下一个交易日。
         """
         today: str = get_trading_day()
         if today == self.current_date:

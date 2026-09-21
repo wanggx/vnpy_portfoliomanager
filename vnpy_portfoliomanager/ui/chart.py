@@ -142,7 +142,9 @@ class PortfolioChart(QtWidgets.QWidget):
         """"""
         super().__init__(parent)
 
-        self.metric: str = METRIC_PNL
+        # 不能叫 self.metric：QPaintDevice 有个虚函数就叫 metric()，同名的实例属性
+        # 会把它盖掉，Qt 一旦调到该虚函数就会抛 "'str' object is not callable"
+        self.current_metric: str = METRIC_PNL
 
         self.history: dict[str, dict[str, dict[str, float]]] = {}
         self.capitals: dict[str, float] = {}
@@ -190,11 +192,12 @@ class PortfolioChart(QtWidgets.QWidget):
 
         self.value_axis: ResultAxisItem = plot_item.getAxis("right")
 
+        # pen=None：LegendItem.paint 会按这里的 pen 画外框，给 NoPen 就不画边框了
         self.legend: pg.LegendItem = self.plot.addLegend(
             offset=(10, 10),
             labelTextColor=WHITE_COLOR,
             brush=pg.mkBrush(0, 0, 0, 120),
-            pen=pg.mkPen(GREY_COLOR),
+            pen=None,
             sampleType=CurveSample
         )
 
@@ -245,10 +248,10 @@ class PortfolioChart(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     def set_metric(self, metric: str) -> None:
         """切换显示的指标：累计盈亏 / 累计收益率"""
-        if metric == self.metric:
+        if metric == self.current_metric:
             return
 
-        self.metric = metric
+        self.current_metric = metric
         self.hide_hover()
         self.redraw()
 
@@ -295,7 +298,7 @@ class PortfolioChart(QtWidgets.QWidget):
         self.build_curve_data()
         self.update_curves()
 
-        self.value_axis.percent = self.metric == METRIC_RETURN
+        self.value_axis.percent = self.current_metric == METRIC_RETURN
 
     def build_curve_data(self) -> None:
         """把历史快照整理为绘图用的坐标序列"""
@@ -310,7 +313,7 @@ class PortfolioChart(QtWidgets.QWidget):
             capital: float = self.capitals.get(reference, 0)
 
             # 没填初始资金时收益率无意义，不画成一条0%平线误导人
-            if self.metric == METRIC_RETURN and not capital:
+            if self.current_metric == METRIC_RETURN and not capital:
                 continue
 
             date_list: list[str] = []
@@ -326,7 +329,7 @@ class PortfolioChart(QtWidgets.QWidget):
                 xs.append(date_to_timestamp(date_str))
                 cum_pnl[date_str] = cum
 
-                if self.metric == METRIC_RETURN:
+                if self.current_metric == METRIC_RETURN:
                     values.append(cum / capital)
                 else:
                     values.append(cum)
@@ -479,7 +482,7 @@ class PortfolioChart(QtWidgets.QWidget):
         lines: list[str] = [f"<b>{date_str}</b>"]
 
         for reference, value in values.items():
-            lines.append(f"{reference}  {format_value(value, self.metric)}")
+            lines.append(f"{reference}  {format_value(value, self.current_metric)}")
 
         self.info_text.setHtml("<br>".join(lines))
         self.info_text.setPos(x, y)

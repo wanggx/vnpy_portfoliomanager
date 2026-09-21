@@ -56,7 +56,6 @@ TRADE_LABELS: list[str] = [
     "名称",
     "交易所",
     "方向",
-    "开平",
     "价格",
     "数量",
     "时间",
@@ -65,7 +64,7 @@ TRADE_LABELS: list[str] = [
 ]
 
 # 成交记录各列默认宽度：列宽可自由拖动，不再按内容自适应，所以得给个初值
-TRADE_COLUMN_WIDTHS: list[int] = [110, 140, 140, 130, 150, 80, 70, 70, 90, 70, 170, 110, 120]
+TRADE_COLUMN_WIDTHS: list[int] = [110, 140, 140, 130, 150, 80, 70, 90, 70, 170, 110, 120]
 
 
 def get_contract_name(main_engine: MainEngine, vt_symbol: str) -> str:
@@ -88,6 +87,14 @@ def get_order_mark(main_engine: MainEngine, vt_orderid: str) -> str:
         return ""
 
     return order.mark
+
+
+def format_pnl(value: float) -> str:
+    """盈亏数值：保留 2 位小数
+
+    引擎算出来的是浮点（价格×乘数×手数），直接 str() 会拖一长串小数。
+    """
+    return f"{value:.2f}"
 
 
 class PortfolioManager(QtWidgets.QWidget):
@@ -351,9 +358,9 @@ class PortfolioManager(QtWidgets.QWidget):
 
         contract_item.setText(3, str(contract_result["open_pos"]))
         contract_item.setText(4, str(contract_result["last_pos"]))
-        contract_item.setText(5, str(contract_result["trading_pnl"]))
-        contract_item.setText(6, str(contract_result["holding_pnl"]))
-        contract_item.setText(7, str(contract_result["total_pnl"]))
+        contract_item.setText(5, format_pnl(contract_result["trading_pnl"]))
+        contract_item.setText(6, format_pnl(contract_result["holding_pnl"]))
+        contract_item.setText(7, format_pnl(contract_result["total_pnl"]))
         contract_item.setText(8, str(contract_result["long_volume"]))
         contract_item.setText(9, str(contract_result["short_volume"]))
 
@@ -364,9 +371,9 @@ class PortfolioManager(QtWidgets.QWidget):
         portfolio_result: dict = event.data
 
         portfolio_item: QtWidgets.QTreeWidgetItem = self.get_portfolio_item(portfolio_result["reference"])
-        portfolio_item.setText(5, str(portfolio_result["trading_pnl"]))
-        portfolio_item.setText(6, str(portfolio_result["holding_pnl"]))
-        portfolio_item.setText(7, str(portfolio_result["total_pnl"]))
+        portfolio_item.setText(5, format_pnl(portfolio_result["trading_pnl"]))
+        portfolio_item.setText(6, format_pnl(portfolio_result["holding_pnl"]))
+        portfolio_item.setText(7, format_pnl(portfolio_result["total_pnl"]))
 
         self.update_item_color(portfolio_item, portfolio_result)
 
@@ -557,7 +564,6 @@ class PortfolioTradeMonitor(QtWidgets.QTableWidget):
         )
         exchange_cell: EnumCell = EnumCell(trade.exchange, trade)
         direction_cell: DirectionCell = DirectionCell(trade.direction, trade)
-        offset_cell: EnumCell = EnumCell(trade.offset, trade)
         price_cell: BaseCell = BaseCell(trade.price, trade)
         volume_cell: BaseCell = BaseCell(trade.volume, trade)
         datetime_cell: TradeTimeCell = TradeTimeCell(trade.datetime, trade)
@@ -570,12 +576,11 @@ class PortfolioTradeMonitor(QtWidgets.QTableWidget):
         self.setItem(0, 4, name_cell)
         self.setItem(0, 5, exchange_cell)
         self.setItem(0, 6, direction_cell)
-        self.setItem(0, 7, offset_cell)
-        self.setItem(0, 8, price_cell)
-        self.setItem(0, 9, volume_cell)
-        self.setItem(0, 10, datetime_cell)
-        self.setItem(0, 11, gateway_cell)
-        self.setItem(0, 12, mark_cell)
+        self.setItem(0, 7, price_cell)
+        self.setItem(0, 8, volume_cell)
+        self.setItem(0, 9, datetime_cell)
+        self.setItem(0, 10, gateway_cell)
+        self.setItem(0, 11, mark_cell)
 
         self.update_row_visible(0)
 

@@ -23,6 +23,11 @@
 16. 成交记录在最后一列新增“标记”列，显示委托的 mark（vnpy 的 `TradeData` 没有该字段，
     需按 `vt_orderid` 回委托缓存取）
 17. 成交记录“时间”列改为显示 yyyyMMdd HH:MM:SS.mmm（原来只有时分秒，跨交易日看不出是哪一天）
+18. 收益曲线图例去掉外框，只保留颜色标识与半透明底
+19. 持仓明细的交易/持仓/总盈亏统一保留 2 位小数（引擎算出来的是浮点，原来会拖一长串小数）
+20. 成交记录去掉“开平”列（本地以 A 股为主，不涉及开平）
+21. 修复 `PortfolioChart.metric` 遮蔽 Qt 虚函数 `QPaintDevice.metric()` 的问题
+    （Qt 一旦调到该虚函数就抛 “'str' object is not callable”），改名 `current_metric`
 
 # 1.1.0版本
 

@@ -48,8 +48,9 @@ class ContractResult:
         self.reference: str = reference
         self.vt_symbol: str = vt_symbol
 
-        self.open_pos: float = open_pos
-        self.last_pos: float = open_pos
+        # 本地以 A 股为主（无融券），仓位为负没有意义：老的存档里若存了负数，一律归零
+        self.open_pos: float = max(open_pos, 0)
+        self.last_pos: float = self.open_pos
 
         self.trading_pnl: float = 0
         self.holding_pnl: float = 0
@@ -75,6 +76,12 @@ class ContractResult:
             self.last_pos += trade.volume
         else:
             self.last_pos -= trade.volume
+
+        # 持仓量不会为负（A 股无融券）。变负说明买入没进账——例如建仓发生在本模块开始
+        # 记账之前，卖出量大于本模块记录的买入量（成交里没带 reference 的也会被丢弃）。
+        # 这里夹到 0，避免持仓明细里出现负数；空头成交量仍如实累计，可据此看出差额。
+        if self.last_pos < 0:
+            self.last_pos = 0
     def roll_to_next_day(self) -> None:
         """自然日切换：收盘仓位滚动为新的开盘仓位，并清空当日累计"""
         self.open_pos = self.last_pos

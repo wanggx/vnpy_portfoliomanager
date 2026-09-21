@@ -28,6 +28,8 @@
 20. 成交记录去掉“开平”列（本地以 A 股为主，不涉及开平）
 21. 修复 `PortfolioChart.metric` 遮蔽 Qt 虚函数 `QPaintDevice.metric()` 的问题
     （Qt 一旦调到该虚函数就抛 “'str' object is not callable”），改名 `current_metric`
+22. 持仓量不再出现负数（A 股无融券）：底仓若在本模块开始记账之前就已买入，卖出会把仓位减成负数，
+    现在成交量与存档载入时统一夹到 0；`空头成交` 仍如实累计，可据此看出差额
 
 # 1.1.0版本
 

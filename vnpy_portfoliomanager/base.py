@@ -1,10 +1,33 @@
 from typing import TYPE_CHECKING
+from datetime import date, datetime, timedelta
 
 from vnpy.trader.object import TickData, TradeData, ContractData
 from vnpy.trader.constant import Direction
 
 if TYPE_CHECKING:
     from .engine import PortfolioEngine
+
+
+# 夜盘开盘前换日：20:00 之后归属下一个交易日
+NIGHT_SESSION_HOUR: int = 20
+
+
+def get_trading_day(now: datetime | None = None) -> str:
+    """取交易日（国内期货惯例：夜盘算下一个交易日）
+
+    - 20:00 之后算下一个自然日（夜盘 21:00 开盘前换日）
+    - 遇周六日顺延到周一（没有节假日日历，长假只能近似）
+    """
+    current: datetime = now or datetime.now()
+
+    day: date = current.date()
+    if current.hour >= NIGHT_SESSION_HOUR:
+        day += timedelta(days=1)
+
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+
+    return day.strftime("%Y-%m-%d")
 
 
 class ContractResult:
@@ -52,7 +75,22 @@ class ContractResult:
             self.last_pos += trade.volume
         else:
             self.last_pos -= trade.volume
+    def roll_to_next_day(self) -> None:
+        """自然日切换：收盘仓位滚动为新的开盘仓位，并清空当日累计"""
+        self.open_pos = self.last_pos
 
+        self.trading_pnl = 0
+        self.holding_pnl = 0
+        self.total_pnl = 0
+
+        # 成交缓存按日清空，避免次日重复计算成交盈亏
+        self.trades.clear()
+        self.new_trades.clear()
+
+        self.long_volume = 0
+        self.short_volume = 0
+        self.long_cost = 0
+        self.short_cost = 0
     def calculate_pnl(self) -> None:
         """"""
         vt_symbol: str = self.vt_symbol
@@ -89,6 +127,10 @@ class ContractResult:
         self.trading_pnl = long_pnl + short_pnl
 
         # 计算未实现利润和总利润
+        #
+        # 基准用 tick.pre_close（昨收盘）：vnpy 的 TickData 没有昨结算价字段，
+        # vnpy_ctp 也只映射了 PreClosePrice，而国内期货盯市应以昨结算价为基准，
+        # 因此期货的持仓盈亏会有（昨结算-昨收）*持仓*乘数 的偏差，无数据源可修。
         self.holding_pnl = (last_price - tick.pre_close) * self.open_pos * size
         self.total_pnl = self.holding_pnl + self.trading_pnl
 
@@ -122,11 +164,27 @@ class PortfolioResult:
         self.holding_pnl: float = 0
         self.total_pnl: float = 0
 
+        # 历史累计盈亏（不含当日）与初始资金
+        self.history_pnl: float = 0
+        self.capital: float = 0
+
     def clear_pnl(self) -> None:
         """"""
         self.trading_pnl = 0
         self.holding_pnl = 0
         self.total_pnl = 0
+
+    @property
+    def cum_pnl(self) -> float:
+        """累计总盈亏（历史累计 + 当日）"""
+        return self.history_pnl + self.total_pnl
+
+    @property
+    def cum_return(self) -> float:
+        """累计收益率，未设置初始资金时返回0"""
+        if not self.capital:
+            return 0
+        return self.cum_pnl / self.capital
 
     def get_data(self) -> dict:
         """获取数据字典"""
@@ -135,5 +193,9 @@ class PortfolioResult:
             "trading_pnl": self.trading_pnl,
             "holding_pnl": self.holding_pnl,
             "total_pnl": self.total_pnl,
+            "history_pnl": self.history_pnl,
+            "capital": self.capital,
+            "cum_pnl": self.cum_pnl,
+            "cum_return": self.cum_return,
         }
         return data

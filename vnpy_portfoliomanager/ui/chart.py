@@ -1,4 +1,6 @@
 from bisect import bisect_left
+from collections import OrderedDict
+from copy import copy
 from datetime import datetime
 from typing import Any
 
@@ -77,6 +79,62 @@ class ResultAxisItem(pg.AxisItem):
         return super().tickStrings(values, scale, spacing)
 
 
+class DateTickAxisItem(pg.DateAxisItem):
+    """X轴：刻度固定显示为 yyyyMMdd
+
+    pg.DateAxisItem 会随缩放把格式换成 %Y/%b/%d/%H:%M，这里统一成 8 位日期；
+    同时把各缩放档位的示例文本也换成 8 位日期——示例文本是 pyqtgraph 估算
+    标签宽度的依据，不改的话仍按 "YYYY"/"MMM" 估算密度，刻度会挤在一起重叠。
+    """
+
+    DATE_FORMAT: str = "%Y%m%d"
+    EXAMPLE_TEXT: str = "20260101"
+
+    def __init__(self, orientation: str = "bottom", **kwargs: Any) -> None:
+        """"""
+        super().__init__(orientation=orientation, **kwargs)
+
+        # zoomLevels 里的对象是模块级共享的，先复制再改示例文本，避免影响其他图表
+        levels: OrderedDict = OrderedDict()
+        for density, zoom_level in self.zoomLevels.items():
+            level = copy(zoom_level)
+            level.exampleText = self.EXAMPLE_TEXT
+            levels[density] = level
+        self.zoomLevels = levels
+
+    def tickStrings(self, values: list[float], scale: float, spacing: float) -> list[str]:
+        """"""
+        strings: list[str] = []
+
+        for value in values:
+            try:
+                strings.append(datetime.fromtimestamp(value).strftime(self.DATE_FORMAT))
+            except (OverflowError, OSError, ValueError):
+                strings.append("")
+
+        return strings
+
+
+class CurveSample(pg.ItemSample):
+    """图例里的示例图标：只画一条颜色线，不画填充三角形
+
+    pyqtgraph 的 ItemSample 在曲线带 fillLevel/fillBrush 时会额外画一个三角形，
+    单条曲线显示填充时图例上就会出现三角形，这里改成纯颜色标识。
+    """
+
+    def paint(self, p: QtGui.QPainter, *args: Any) -> None:
+        """"""
+        pen: QtGui.QPen = pg.mkPen(self.item.opts["pen"])
+        color: QtGui.QColor = pen.color()
+
+        p.setPen(pen)
+        p.drawLine(0, 10, 20, 10)
+
+        p.setPen(pg.mkPen(color))
+        p.setBrush(pg.mkBrush(color))
+        p.drawEllipse(QtCore.QPointF(10, 10), 4, 4)
+
+
 class PortfolioChart(QtWidgets.QWidget):
     """组合累计盈亏曲线：支持多组合对比与十字光标读数"""
 
@@ -108,7 +166,7 @@ class PortfolioChart(QtWidgets.QWidget):
         self.plot: pg.PlotWidget = pg.PlotWidget(
             axisItems={
                 "right": ResultAxisItem(orientation="right"),
-                "bottom": pg.DateAxisItem(orientation="bottom")
+                "bottom": DateTickAxisItem(orientation="bottom")
             },
             background=BLACK_COLOR
         )
@@ -136,7 +194,8 @@ class PortfolioChart(QtWidgets.QWidget):
             offset=(10, 10),
             labelTextColor=WHITE_COLOR,
             brush=pg.mkBrush(0, 0, 0, 120),
-            pen=pg.mkPen(GREY_COLOR)
+            pen=pg.mkPen(GREY_COLOR),
+            sampleType=CurveSample
         )
 
         crosshair_pen: QtGui.QPen = pg.mkPen(WHITE_COLOR, width=1)

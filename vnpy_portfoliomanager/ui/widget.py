@@ -1,7 +1,8 @@
 import csv
 from datetime import datetime
+from typing import Any
 
-from vnpy.trader.object import TradeData
+from vnpy.trader.object import ContractData, OrderData, TradeData
 from vnpy.event.engine import Event
 from vnpy.trader.ui import QtWidgets, QtCore, QtGui
 
@@ -37,6 +38,7 @@ WHITE_COLOR = QtGui.QColor("white")
 TREE_LABELS: list[str] = [
     "组合名称",
     "本地代码",
+    "名称",
     "开盘仓位",
     "当前仓位",
     "交易盈亏",
@@ -51,14 +53,41 @@ TRADE_LABELS: list[str] = [
     "成交号",
     "委托号",
     "代码",
+    "名称",
     "交易所",
     "方向",
     "开平",
     "价格",
     "数量",
     "时间",
-    "接口"
+    "接口",
+    "标记"
 ]
+
+# 成交记录各列默认宽度：列宽可自由拖动，不再按内容自适应，所以得给个初值
+TRADE_COLUMN_WIDTHS: list[int] = [110, 140, 140, 130, 150, 80, 70, 70, 90, 70, 170, 110, 120]
+
+
+def get_contract_name(main_engine: MainEngine, vt_symbol: str) -> str:
+    """从主引擎获取合约名称，合约尚未加载时返回空字符串"""
+    contract: ContractData | None = main_engine.get_contract(vt_symbol)
+    if not contract:
+        return ""
+
+    return contract.name
+
+
+def get_order_mark(main_engine: MainEngine, vt_orderid: str) -> str:
+    """从主引擎获取委托的标记（mark）
+
+    vnpy 的 TradeData 没有 mark 字段（OrderData / OrderRequest 才有），
+    所以成交流水里要按 vt_orderid 回到委托上取。
+    """
+    order: OrderData | None = main_engine.get_order(vt_orderid)
+    if not order:
+        return ""
+
+    return order.mark
 
 
 class PortfolioManager(QtWidgets.QWidget):
@@ -97,7 +126,7 @@ class PortfolioManager(QtWidgets.QWidget):
         self.summary.signal_capital.connect(self.portfolio_engine.set_capital)
         self.summary.signal_visible.connect(self.apply_visible_references)
 
-        self.monitor: PortfolioTradeMonitor = PortfolioTradeMonitor()
+        self.monitor: PortfolioTradeMonitor = PortfolioTradeMonitor(self.main_engine)
 
         tabs: QtWidgets.QTabWidget = QtWidgets.QTabWidget()
         tabs.addTab(self.create_chart_tab(), "收益曲线")
@@ -137,7 +166,8 @@ class PortfolioManager(QtWidgets.QWidget):
 
         tree.setColumnWidth(0, 150)
         tree.setColumnWidth(1, 140)
-        for column in range(2, self.column_count):
+        tree.setColumnWidth(2, 150)
+        for column in range(3, self.column_count):
             tree.setColumnWidth(column, 90)
 
         delegate: TreeDelegate = TreeDelegate()
@@ -292,6 +322,7 @@ class PortfolioManager(QtWidgets.QWidget):
         if not contract_item:
             contract_item = QtWidgets.QTreeWidgetItem()
             contract_item.setText(1, vt_symbol)
+            contract_item.setText(2, get_contract_name(self.main_engine, vt_symbol))
             for i in range(2, self.column_count):
                 contract_item.setTextAlignment(i, QtCore.Qt.AlignmentFlag.AlignCenter)
 
@@ -310,13 +341,21 @@ class PortfolioManager(QtWidgets.QWidget):
             contract_result["reference"],
             contract_result["vt_symbol"]
         )
-        contract_item.setText(2, str(contract_result["open_pos"]))
-        contract_item.setText(3, str(contract_result["last_pos"]))
-        contract_item.setText(4, str(contract_result["trading_pnl"]))
-        contract_item.setText(5, str(contract_result["holding_pnl"]))
-        contract_item.setText(6, str(contract_result["total_pnl"]))
-        contract_item.setText(7, str(contract_result["long_volume"]))
-        contract_item.setText(8, str(contract_result["short_volume"]))
+
+        # 合约信息可能比成交晚加载，名称空缺时每次推送都补一下
+        if not contract_item.text(2):
+            contract_item.setText(
+                2,
+                get_contract_name(self.main_engine, contract_result["vt_symbol"])
+            )
+
+        contract_item.setText(3, str(contract_result["open_pos"]))
+        contract_item.setText(4, str(contract_result["last_pos"]))
+        contract_item.setText(5, str(contract_result["trading_pnl"]))
+        contract_item.setText(6, str(contract_result["holding_pnl"]))
+        contract_item.setText(7, str(contract_result["total_pnl"]))
+        contract_item.setText(8, str(contract_result["long_volume"]))
+        contract_item.setText(9, str(contract_result["short_volume"]))
 
         self.update_item_color(contract_item, contract_result)
 
@@ -325,9 +364,9 @@ class PortfolioManager(QtWidgets.QWidget):
         portfolio_result: dict = event.data
 
         portfolio_item: QtWidgets.QTreeWidgetItem = self.get_portfolio_item(portfolio_result["reference"])
-        portfolio_item.setText(4, str(portfolio_result["trading_pnl"]))
-        portfolio_item.setText(5, str(portfolio_result["holding_pnl"]))
-        portfolio_item.setText(6, str(portfolio_result["total_pnl"]))
+        portfolio_item.setText(5, str(portfolio_result["trading_pnl"]))
+        portfolio_item.setText(6, str(portfolio_result["holding_pnl"]))
+        portfolio_item.setText(7, str(portfolio_result["total_pnl"]))
 
         self.update_item_color(portfolio_item, portfolio_result)
 
@@ -371,7 +410,7 @@ class PortfolioManager(QtWidgets.QWidget):
         item: QtWidgets.QTreeWidgetItem,
         result: dict
     ) -> None:
-        start_column: int = 4
+        start_column: int = 5
         for n, pnl in enumerate([
             result["trading_pnl"],
             result["holding_pnl"],
@@ -445,13 +484,33 @@ class PortfolioManager(QtWidgets.QWidget):
         self.showMaximized()
 
 
+class TradeTimeCell(TimeCell):
+    """成交时间：在 vnpy TimeCell 基础上补上 yyyyMMdd 日期
+
+    TimeCell 只显示 %H:%M:%S，成交记录跨交易日时看不出是哪一天。
+    """
+
+    def set_content(self, content: datetime | None, data: Any) -> None:
+        """"""
+        if content is None:
+            return
+
+        content = content.astimezone(self.local_tz)
+        millisecond: int = int(content.microsecond / 1000)
+
+        self._text = f"{content.strftime('%Y%m%d %H:%M:%S')}.{millisecond:03d}"
+        self._data = data
+        self.setText(self._text)
+
+
 class PortfolioTradeMonitor(QtWidgets.QTableWidget):
     """"""
 
-    def __init__(self) -> None:
+    def __init__(self, main_engine: MainEngine) -> None:
         """"""
         super().__init__()
 
+        self.main_engine: MainEngine = main_engine
         self.trade_ids: set[str] = set()
         self.filter_reference: str = ""
         self.filter_symbol: str = ""
@@ -466,9 +525,14 @@ class PortfolioTradeMonitor(QtWidgets.QTableWidget):
         self.setEditTriggers(self.EditTrigger.NoEditTriggers)
         self.setSelectionBehavior(self.SelectionBehavior.SelectRows)
 
+        # Interactive：列宽可以用鼠标拖动调整（不再按内容自适应，所以下面给各列一个初值）
         header: QtWidgets.QHeaderView = self.horizontalHeader()
-        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(False)
+        header.setMinimumSectionSize(50)
+
+        for column, width in enumerate(TRADE_COLUMN_WIDTHS):
+            self.setColumnWidth(column, width)
 
     def update_trade(self, trade: TradeData) -> None:
         """"""
@@ -482,26 +546,36 @@ class PortfolioTradeMonitor(QtWidgets.QTableWidget):
         reference_cell: BaseCell = BaseCell(reference, trade)
         tradeid_cell: BaseCell = BaseCell(trade.tradeid, trade)
         orderid_cell: BaseCell = BaseCell(trade.orderid, trade)
+        mark_cell: BaseCell = BaseCell(
+            get_order_mark(self.main_engine, trade.vt_orderid),
+            trade
+        )
         symbol_cell: BaseCell = BaseCell(trade.symbol, trade)
+        name_cell: BaseCell = BaseCell(
+            get_contract_name(self.main_engine, trade.vt_symbol),
+            trade
+        )
         exchange_cell: EnumCell = EnumCell(trade.exchange, trade)
         direction_cell: DirectionCell = DirectionCell(trade.direction, trade)
         offset_cell: EnumCell = EnumCell(trade.offset, trade)
         price_cell: BaseCell = BaseCell(trade.price, trade)
         volume_cell: BaseCell = BaseCell(trade.volume, trade)
-        datetime_cell: TimeCell = TimeCell(trade.datetime, trade)
+        datetime_cell: TradeTimeCell = TradeTimeCell(trade.datetime, trade)
         gateway_cell: BaseCell = BaseCell(trade.gateway_name, trade)
 
         self.setItem(0, 0, reference_cell)
         self.setItem(0, 1, tradeid_cell)
         self.setItem(0, 2, orderid_cell)
         self.setItem(0, 3, symbol_cell)
-        self.setItem(0, 4, exchange_cell)
-        self.setItem(0, 5, direction_cell)
-        self.setItem(0, 6, offset_cell)
-        self.setItem(0, 7, price_cell)
-        self.setItem(0, 8, volume_cell)
-        self.setItem(0, 9, datetime_cell)
-        self.setItem(0, 10, gateway_cell)
+        self.setItem(0, 4, name_cell)
+        self.setItem(0, 5, exchange_cell)
+        self.setItem(0, 6, direction_cell)
+        self.setItem(0, 7, offset_cell)
+        self.setItem(0, 8, price_cell)
+        self.setItem(0, 9, volume_cell)
+        self.setItem(0, 10, datetime_cell)
+        self.setItem(0, 11, gateway_cell)
+        self.setItem(0, 12, mark_cell)
 
         self.update_row_visible(0)
 

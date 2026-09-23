@@ -66,6 +66,8 @@ class PortfolioEngine(BaseEngine):
         self.subscribed: set[str] = set()
         self.result_symbols: set[str] = set()
         self.order_reference_map: dict[str, str] = {}
+        # 已经告警过的"无组合标记"成交，避免重复推送时刷屏
+        self.unmatched_tradeids: set[str] = set()
         self.contract_results: dict[tuple[str, str], ContractResult] = {}
         self.portfolio_results: dict[str, PortfolioResult] = {}
 
@@ -109,10 +111,17 @@ class PortfolioEngine(BaseEngine):
         """"""
         order: OrderData = event.data
 
-        if order.vt_orderid not in self.order_reference_map:
+        reference: str = self.order_reference_map.get(order.vt_orderid, "")
+
+        # 只有带回 reference 的推送才是可信来源，空值一律不入表：不少网关（如 XT/QMT）
+        # 的委托状态推送、以及启动时的委托查询回报都不带 reference（XT 网关只把
+        # req.reference 塞给券商端，回报里没有这个字段）。把空值记进去会把整份映射
+        # 污染成空串，之后每笔成交都归不到组合上，表现就是成交记录空白。
+        if order.reference:
             self.order_reference_map[order.vt_orderid] = order.reference
-        else:
-            order.reference = self.order_reference_map[order.vt_orderid]
+        elif reference:
+            # 后续推送没带 reference：用本地缓存补回，别的引擎/界面也要读这个字段
+            order.reference = reference
 
     def process_trade_event(self, event: Event) -> None:
         """"""
@@ -120,6 +129,14 @@ class PortfolioEngine(BaseEngine):
 
         reference: str = self.order_reference_map.get(trade.vt_orderid, "")
         if not reference:
+            # 静默丢弃会让"成交记录空白"极难排查，这里明确告警（同一笔只报一次）
+            if trade.vt_tradeid not in self.unmatched_tradeids:
+                self.unmatched_tradeids.add(trade.vt_tradeid)
+                self.write_log(
+                    f"成交{trade.vt_tradeid}（委托{trade.vt_orderid}，{trade.vt_symbol}）"
+                    "缺少组合标记，已忽略：委托映射里没有这笔委托，该成交不会计入"
+                    "盈亏与成交记录"
+                )
             return
 
         vt_symbol: str = trade.vt_symbol
@@ -402,9 +419,12 @@ class PortfolioEngine(BaseEngine):
 
     def replay_trades(self) -> None:
         """回放当日成交：重建当前仓位与成交成本（last_pos = open_pos + 当日成交）"""
+        skipped: int = 0
+
         for trade in self.main_engine.get_all_trades():
             reference: str = self.order_reference_map.get(trade.vt_orderid, "")
             if not reference:
+                skipped += 1
                 continue
 
             key: tuple[str, str] = (reference, trade.vt_symbol)
@@ -414,6 +434,14 @@ class PortfolioEngine(BaseEngine):
                 self.contract_results[key] = contract_result
 
             contract_result.update_trade(trade)
+
+        # 映射缺失（例如程序在下单之后才启动、或映射文件被跨日覆盖）时静默跳过，
+        # 结果就是当天成交全丢，这里至少留一条可追溯的记录
+        if skipped:
+            self.write_log(
+                f"当日成交回放：{skipped} 笔成交找不到组合标记（委托映射缺失），"
+                "这些成交不会计入盈亏与成交记录"
+            )
 
     def update_result_symbols(self) -> None:
         """按当前仓位刷新需要订阅行情的合约集合"""
@@ -481,7 +509,24 @@ class PortfolioEngine(BaseEngine):
         if not data:
             return
 
-        self.history = data.get("history", {})
+        history: dict = data.get("history", {})
+
+        # 丢弃晚于当前交易日的快照：只可能是旧的"20:00 之后算下一交易日"口径写下的
+        # 脏点（A 股没有夜盘，那天其实还是同一天），留着会让曲线多一个点、
+        # 累计合计偏大。
+        dropped: list[str] = []
+        for reference, days in history.items():
+            for date_str in list(days.keys()):
+                if date_str > self.current_date:
+                    days.pop(date_str)
+                    dropped.append(f"{reference}@{date_str}")
+
+        self.history = history
+
+        if dropped:
+            self.write_log(
+                f"已忽略晚于当前交易日的盈亏快照（旧口径脏数据）：{', '.join(dropped)}"
+            )
 
     def save_history(self) -> None:
         """"""
@@ -580,9 +625,22 @@ class PortfolioEngine(BaseEngine):
 
     def save_order(self) -> None:
         """"""
+        # 只落盘有效映射：空串是"这一笔没拿到 reference"的占位，写进去会把上次留下的
+        # 好映射覆盖掉（同一天早先实例存的映射是成交归属的唯一恢复来源）。
+        data: dict[str, str] = {
+            key: value
+            for key, value in self.order_reference_map.items()
+            if value
+        }
+
+        if not data:
+            existing: dict = load_json(self.order_filename)
+            if existing.get("date") == get_trading_day() and existing.get("data"):
+                return
+
         order_data: dict[str, Any] = {
             "date": get_trading_day(),
-            "data": self.order_reference_map
+            "data": data
         }
         save_json(self.order_filename, order_data)
 

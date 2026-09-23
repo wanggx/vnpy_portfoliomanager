@@ -1,8 +1,11 @@
 import csv
-from datetime import datetime
+import threading
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
-from vnpy.trader.object import ContractData, OrderData, TradeData
+from vnpy.trader.constant import Direction, Exchange
+from vnpy.trader.object import ContractData
 from vnpy.event.engine import Event
 from vnpy.trader.ui import QtWidgets, QtCore, QtGui
 
@@ -14,6 +17,7 @@ from vnpy.trader.ui.widget import (
     TimeCell
 )
 
+from ..database import trade_key
 from ..engine import (
     APP_NAME,
     EVENT_PM_CONTRACT,
@@ -66,6 +70,9 @@ TRADE_LABELS: list[str] = [
 # 成交记录各列默认宽度：列宽可自由拖动，不再按内容自适应，所以得给个初值
 TRADE_COLUMN_WIDTHS: list[int] = [110, 140, 140, 130, 150, 80, 70, 90, 70, 170, 110, 120]
 
+# “全部”快捷区间用的起始日期：本模块的成交只会从现在开始积累，用这个值占位即可
+TRADE_ALL_START_DATE: date = date(2000, 1, 1)
+
 
 def get_contract_name(main_engine: MainEngine, vt_symbol: str) -> str:
     """从主引擎获取合约名称，合约尚未加载时返回空字符串"""
@@ -76,17 +83,37 @@ def get_contract_name(main_engine: MainEngine, vt_symbol: str) -> str:
     return contract.name
 
 
-def get_order_mark(main_engine: MainEngine, vt_orderid: str) -> str:
-    """从主引擎获取委托的标记（mark）
+def make_exchange(row: dict[str, Any]) -> Exchange | None:
+    """把库里存的交易所枚举名还原回 Exchange，无法识别时返回 None（单元格留空）"""
+    name: str = str(row.get("exchange") or "")
+    if not name:
+        return None
 
-    vnpy 的 TradeData 没有 mark 字段（OrderData / OrderRequest 才有），
-    所以成交流水里要按 vt_orderid 回到委托上取。
-    """
-    order: OrderData | None = main_engine.get_order(vt_orderid)
-    if not order:
+    try:
+        return Exchange[name]
+    except KeyError:
+        return None
+
+
+def make_direction(row: dict[str, Any]) -> Direction | None:
+    """把库里存的方向枚举名还原回 Direction，无法识别时返回 None"""
+    name: str = str(row.get("direction") or "")
+    if not name:
+        return None
+
+    try:
+        return Direction[name]
+    except KeyError:
+        return None
+
+
+def format_number(value: Any) -> str:
+    """价格/数量列显示：库里的 DECIMAL 转 float 后再 str，与内存模式下的显示一致"""
+    if isinstance(value, (Decimal, int, float)):
+        return str(float(value))
+    if value is None:
         return ""
-
-    return order.mark
+    return str(value)
 
 
 def format_pnl(value: float) -> str:
@@ -104,6 +131,8 @@ class PortfolioManager(QtWidgets.QWidget):
     signal_portfolio: QtCore.Signal = QtCore.Signal(Event)
     signal_trade: QtCore.Signal = QtCore.Signal(Event)
     signal_history: QtCore.Signal = QtCore.Signal(Event)
+    # 历史成交查询结果：后台线程 emit，Qt 自动排队到界面线程
+    signal_trades_loaded: QtCore.Signal = QtCore.Signal(dict)
 
     def __init__(self, main_engine: MainEngine, event_engine: EventEngine) -> None:
         """"""
@@ -117,6 +146,13 @@ class PortfolioManager(QtWidgets.QWidget):
         self.column_count: int = len(TREE_LABELS)
         self.contract_items: dict[tuple[str, str], QtWidgets.QTreeWidgetItem] = {}
         self.portfolio_items: dict[str, QtWidgets.QTreeWidgetItem] = {}
+
+        # 查询序号：日期/筛选条件变得比后台线程快时，用序号丢弃过期结果
+        self.trade_query_token: int = 0
+        # 查询在途期间收到的实时成交：查库结果落地后要补插回去，
+        # 否则查库快照早于成交时会"刚显示又消失"（数据库里其实已经有了）
+        self.trade_query_running: bool = False
+        self.trade_pending_rows: list[dict[str, Any]] = []
 
         self.init_ui()
         self.register_event()
@@ -133,7 +169,7 @@ class PortfolioManager(QtWidgets.QWidget):
         self.summary.signal_capital.connect(self.portfolio_engine.set_capital)
         self.summary.signal_visible.connect(self.apply_visible_references)
 
-        self.monitor: PortfolioTradeMonitor = PortfolioTradeMonitor(self.main_engine)
+        self.monitor: PortfolioTradeMonitor = PortfolioTradeMonitor()
 
         tabs: QtWidgets.QTabWidget = QtWidgets.QTabWidget()
         tabs.addTab(self.create_chart_tab(), "收益曲线")
@@ -252,6 +288,40 @@ class PortfolioManager(QtWidgets.QWidget):
 
     def create_trade_tab(self) -> QtWidgets.QWidget:
         """"""
+        # 日期范围与快捷区间：默认只看当日（与原来"只显示当日成交"的习惯一致）
+        self.trade_start_date: QtWidgets.QDateEdit = self.create_trade_date_edit()
+        self.trade_end_date: QtWidgets.QDateEdit = self.create_trade_date_edit()
+
+        self.trade_query_button: QtWidgets.QPushButton = QtWidgets.QPushButton("查询")
+        self.trade_query_button.clicked.connect(self.refresh_trades)
+
+        today_button: QtWidgets.QPushButton = QtWidgets.QPushButton("今天")
+        today_button.clicked.connect(lambda: self.apply_trade_quick_range(0))
+
+        week_button: QtWidgets.QPushButton = QtWidgets.QPushButton("近一周")
+        week_button.clicked.connect(lambda: self.apply_trade_quick_range(7))
+
+        month_button: QtWidgets.QPushButton = QtWidgets.QPushButton("近一月")
+        month_button.clicked.connect(lambda: self.apply_trade_quick_range(30))
+
+        all_button: QtWidgets.QPushButton = QtWidgets.QPushButton("全部")
+        all_button.clicked.connect(
+            lambda: self.set_trade_date_range(TRADE_ALL_START_DATE, date.today())
+        )
+
+        range_layout: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        range_layout.addWidget(QtWidgets.QLabel("日期"))
+        range_layout.addWidget(self.trade_start_date)
+        range_layout.addWidget(QtWidgets.QLabel("~"))
+        range_layout.addWidget(self.trade_end_date)
+        range_layout.addWidget(today_button)
+        range_layout.addWidget(week_button)
+        range_layout.addWidget(month_button)
+        range_layout.addWidget(all_button)
+        range_layout.addWidget(self.trade_query_button)
+        range_layout.addStretch()
+
+        # 组合/合约改为服务端查询条件，可选项来自库里出现过的值
         self.trade_reference_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.trade_reference_combo.setMinimumWidth(140)
         self.trade_reference_combo.addItem("全部组合", "")
@@ -268,22 +338,188 @@ class PortfolioManager(QtWidgets.QWidget):
         export_button: QtWidgets.QPushButton = QtWidgets.QPushButton("导出CSV")
         export_button.clicked.connect(self.export_trades)
 
-        hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
-        hbox.addWidget(QtWidgets.QLabel("组合"))
-        hbox.addWidget(self.trade_reference_combo)
-        hbox.addWidget(QtWidgets.QLabel("合约"))
-        hbox.addWidget(self.trade_symbol_combo)
-        hbox.addWidget(clear_button)
-        hbox.addStretch()
-        hbox.addWidget(export_button)
+        filter_layout: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
+        filter_layout.addWidget(QtWidgets.QLabel("组合"))
+        filter_layout.addWidget(self.trade_reference_combo)
+        filter_layout.addWidget(QtWidgets.QLabel("合约"))
+        filter_layout.addWidget(self.trade_symbol_combo)
+        filter_layout.addWidget(clear_button)
+        filter_layout.addStretch()
+        filter_layout.addWidget(export_button)
+
+        self.trade_status_label: QtWidgets.QLabel = QtWidgets.QLabel()
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
-        vbox.addLayout(hbox)
+        vbox.addLayout(range_layout)
+        vbox.addLayout(filter_layout)
+        vbox.addWidget(self.trade_status_label)
         vbox.addWidget(self.monitor)
 
         widget: QtWidgets.QWidget = QtWidgets.QWidget()
         widget.setLayout(vbox)
         return widget
+
+    def create_trade_date_edit(self) -> QtWidgets.QDateEdit:
+        """日期选择框：带日历弹出，默认今天"""
+        date_edit: QtWidgets.QDateEdit = QtWidgets.QDateEdit()
+        date_edit.setCalendarPopup(True)
+        date_edit.setDisplayFormat("yyyy-MM-dd")
+        date_edit.setDate(QtCore.QDate.currentDate())
+        date_edit.setMinimumWidth(120)
+        date_edit.dateChanged.connect(self.on_trade_date_changed)
+        return date_edit
+
+    def get_trade_date_range(self) -> tuple[date, date]:
+        """当前起止日期（QDate → datetime.date）"""
+        start: QtCore.QDate = self.trade_start_date.date()
+        end: QtCore.QDate = self.trade_end_date.date()
+        return (
+            date(start.year(), start.month(), start.day()),
+            date(end.year(), end.month(), end.day())
+        )
+
+    def set_trade_date_range(self, start_date: date, end_date: date) -> None:
+        """同时设置起止日期，只触发一次查询"""
+        for date_edit in (self.trade_start_date, self.trade_end_date):
+            date_edit.blockSignals(True)
+
+        self.trade_start_date.setDate(
+            QtCore.QDate(start_date.year, start_date.month, start_date.day)
+        )
+        self.trade_end_date.setDate(
+            QtCore.QDate(end_date.year, end_date.month, end_date.day)
+        )
+
+        for date_edit in (self.trade_start_date, self.trade_end_date):
+            date_edit.blockSignals(False)
+
+        self.refresh_trades()
+
+    def apply_trade_quick_range(self, days: int) -> None:
+        """快捷区间：days 为向前回溯的天数（0 = 仅今天）"""
+        today: date = date.today()
+        self.set_trade_date_range(today - timedelta(days=days), today)
+
+    def on_trade_date_changed(self) -> None:
+        """日期变化：起始晚于结束时把被改的那个同步到另一端，避免查出空结果"""
+        sender: Any = self.sender()
+        start, end = self.get_trade_date_range()
+
+        if start > end:
+            is_start: bool = sender is self.trade_start_date
+            source: QtWidgets.QDateEdit = (
+                self.trade_start_date if is_start else self.trade_end_date
+            )
+            target: QtWidgets.QDateEdit = (
+                self.trade_end_date if is_start else self.trade_start_date
+            )
+
+            target.blockSignals(True)
+            target.setDate(source.date())
+            target.blockSignals(False)
+
+        self.refresh_trades()
+
+    def refresh_trades(self) -> None:
+        """按当前日期范围与筛选条件重查成交记录"""
+        if not self.portfolio_engine.is_trade_db_ready():
+            # 未加载 SqlApp：退回主引擎内存里的当日成交（没有历史可查）
+            self.trade_query_running = False
+            self.trade_pending_rows = []
+            self.monitor.set_range(date.min, date.max)
+            self.monitor.set_rows(self.portfolio_engine.get_reference_trade_rows())
+            self.trade_status_label.setText("未加载 SqlApp，仅显示当日内存成交，无法查询历史")
+            return
+
+        start, end = self.get_trade_date_range()
+        reference: str = self.trade_reference_combo.currentData() or ""
+        symbol: str = self.trade_symbol_combo.currentData() or ""
+
+        # 实时成交插入时用同一区间判断是否落在当前视图内
+        self.monitor.set_range(start, end)
+
+        self.trade_query_token += 1
+        token: int = self.trade_query_token
+        self.trade_query_running = True
+        self.trade_pending_rows = []
+
+        self.trade_query_button.setEnabled(False)
+        self.trade_status_label.setText("查询中…")
+
+        thread: threading.Thread = threading.Thread(
+            target=self.run_trade_query,
+            args=(token, start, end, reference, symbol),
+            daemon=True
+        )
+        thread.start()
+
+    def run_trade_query(
+        self,
+        token: int,
+        start_date: date,
+        end_date: date,
+        reference: str,
+        symbol: str
+    ) -> None:
+        """后台线程：查库（同步接口，线程各自持有连接），结果通过信号回界面线程"""
+        data: dict[str, Any] = self.portfolio_engine.query_trades(
+            start_date,
+            end_date,
+            reference,
+            symbol
+        )
+        data["token"] = token
+        self.signal_trades_loaded.emit(data)
+
+    def process_trades_loaded(self, data: dict[str, Any]) -> None:
+        """查询返回：刷新表格与状态栏（只采纳最后一次查询的结果）"""
+        if data.get("token") != self.trade_query_token:
+            return
+
+        self.trade_query_running = False
+        self.trade_query_button.setEnabled(True)
+
+        error: str = data.get("error", "")
+        if error:
+            self.trade_status_label.setText(f"查询失败：{error}")
+            return
+
+        rows: list[dict[str, Any]] = data.get("rows", [])
+        self.monitor.set_rows(rows)
+
+        # 补插查询期间到达的实时成交（set_rows 会把它们连同旧结果一起清掉；
+        # 已经包含在查询结果里的会按 (交易日, vt_tradeid) 去重，不会重复）
+        for row in self.trade_pending_rows:
+            self.monitor.append_row(row)
+        self.trade_pending_rows = []
+
+        # 历史查询里出现过的组合/合约也补进筛选下拉框（下次查询就能按它筛）
+        for row in rows:
+            self.add_trade_filter_option(row)
+
+        if data.get("truncated"):
+            limit: int = self.portfolio_engine.sql_settings.max_rows
+            self.trade_status_label.setText(
+                f"已显示最新的 {limit} 条，可能有更多记录，请缩小日期范围"
+            )
+        else:
+            self.trade_status_label.setText(f"共 {len(rows)} 条成交记录")
+
+    def init_trade_filter_options(self) -> None:
+        """初始化筛选下拉框：优先取库里出现过的组合/合约（历史组合也能筛到）"""
+        references, symbols = self.portfolio_engine.get_trade_filter_options()
+
+        for reference in references:
+            if self.trade_reference_combo.findData(reference) < 0:
+                self.trade_reference_combo.addItem(reference, reference)
+
+        for symbol in symbols:
+            if self.trade_symbol_combo.findData(symbol) < 0:
+                self.trade_symbol_combo.addItem(symbol, symbol)
+
+        # 未接入数据库时至少把内存里的成交塞进去
+        for row in self.portfolio_engine.get_reference_trade_rows():
+            self.add_trade_filter_option(row)
 
     def register_event(self) -> None:
         """"""
@@ -291,6 +527,7 @@ class PortfolioManager(QtWidgets.QWidget):
         self.signal_portfolio.connect(self.process_portfolio_event)
         self.signal_trade.connect(self.process_trade_event)
         self.signal_history.connect(self.process_history_event)
+        self.signal_trades_loaded.connect(self.process_trades_loaded)
 
         self.event_engine.register(EVENT_PM_CONTRACT, self.signal_contract.emit)
         self.event_engine.register(EVENT_PM_PORTFOLIO, self.signal_portfolio.emit)
@@ -298,11 +535,9 @@ class PortfolioManager(QtWidgets.QWidget):
         self.event_engine.register(EVENT_PM_HISTORY, self.signal_history.emit)
 
     def init_data(self) -> None:
-        """初始化已有的成交记录与历史盈亏"""
-        for trade in self.portfolio_engine.get_all_reference_trades():
-            self.monitor.update_trade(trade)
-            self.add_trade_filter_option(trade)
-
+        """初始化成交记录与历史盈亏"""
+        self.init_trade_filter_options()
+        self.refresh_trades()
         self.update_history(self.portfolio_engine.get_history_data())
 
     def get_portfolio_item(self, reference: str) -> QtWidgets.QTreeWidgetItem:
@@ -379,11 +614,12 @@ class PortfolioManager(QtWidgets.QWidget):
 
     def process_trade_event(self, event: Event) -> None:
         """"""
-        trade: TradeData = event.data
+        row: dict[str, Any] = event.data
 
-        self.monitor.update_trade(trade)
-        self.add_trade_filter_option(trade)
-
+        self.monitor.append_row(row)
+        self.add_trade_filter_option(row)
+        if self.trade_query_running:
+            self.trade_pending_rows.append(row)
     def process_history_event(self, event: Event) -> None:
         """"""
         self.update_history(event.data)
@@ -445,27 +681,34 @@ class PortfolioManager(QtWidgets.QWidget):
         """按汇总表勾选状态刷新图表上的曲线"""
         self.chart.set_visible_references(self.summary.get_visible_references())
 
-    def add_trade_filter_option(self, trade: TradeData) -> None:
+    def add_trade_filter_option(self, row: dict[str, Any]) -> None:
         """把新的组合/合约加入筛选下拉框"""
-        reference: str = getattr(trade, "reference", "")
+        reference: str = row.get("reference", "")
 
         if reference and self.trade_reference_combo.findData(reference) < 0:
             self.trade_reference_combo.addItem(reference, reference)
 
-        if self.trade_symbol_combo.findData(trade.symbol) < 0:
-            self.trade_symbol_combo.addItem(trade.symbol, trade.symbol)
+        symbol: str = row.get("symbol", "")
+
+        if symbol and self.trade_symbol_combo.findData(symbol) < 0:
+            self.trade_symbol_combo.addItem(symbol, symbol)
 
     def apply_trade_filter(self) -> None:
-        """"""
+        """筛选条件变化：同步表格的过滤状态（实时成交用）并重新查询"""
         self.monitor.set_filter(
-            self.trade_reference_combo.currentData(),
-            self.trade_symbol_combo.currentData()
+            self.trade_reference_combo.currentData() or "",
+            self.trade_symbol_combo.currentData() or ""
         )
+        self.refresh_trades()
 
     def clear_trade_filter(self) -> None:
-        """"""
-        self.trade_reference_combo.setCurrentIndex(0)
-        self.trade_symbol_combo.setCurrentIndex(0)
+        """清空组合/合约筛选（只触发一次查询）"""
+        for combo in (self.trade_reference_combo, self.trade_symbol_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+
+        self.apply_trade_filter()
 
     def export_trades(self) -> None:
         """导出当前筛选后的成交记录"""
@@ -502,7 +745,12 @@ class TradeTimeCell(TimeCell):
         if content is None:
             return
 
-        content = content.astimezone(self.local_tz)
+        # 从数据库读回的是本地时区的 naive datetime（vnpy 推送的则带时区）
+        if content.tzinfo is None:
+            content = content.replace(tzinfo=self.local_tz)
+        else:
+            content = content.astimezone(self.local_tz)
+
         millisecond: int = int(content.microsecond / 1000)
 
         self._text = f"{content.strftime('%Y%m%d %H:%M:%S')}.{millisecond:03d}"
@@ -511,16 +759,23 @@ class TradeTimeCell(TimeCell):
 
 
 class PortfolioTradeMonitor(QtWidgets.QTableWidget):
-    """"""
+    """成交记录表格
 
-    def __init__(self, main_engine: MainEngine) -> None:
+    行数据统一是 dict（键见 ``database.TRADE_COLUMNS``）：查库刷新与实时插入共用
+    同一套渲染逻辑，界面只跟这一种结构打交道。
+    """
+
+    def __init__(self) -> None:
         """"""
         super().__init__()
 
-        self.main_engine: MainEngine = main_engine
-        self.trade_ids: set[str] = set()
+        # 已插入的行：键 (交易日, vt_tradeid)（CTP 的 tradeid 只在当日内唯一）
+        self.trade_keys: set[tuple[str, str]] = set()
         self.filter_reference: str = ""
         self.filter_symbol: str = ""
+        # 当前显示的日期范围：实时成交只有落在范围内才插入
+        self.start_date: date | None = None
+        self.end_date: date | None = None
 
         self.init_ui()
 
@@ -541,48 +796,74 @@ class PortfolioTradeMonitor(QtWidgets.QTableWidget):
         for column, width in enumerate(TRADE_COLUMN_WIDTHS):
             self.setColumnWidth(column, width)
 
-    def update_trade(self, trade: TradeData) -> None:
-        """"""
-        if trade.vt_tradeid in self.trade_ids:
+    def set_range(self, start_date: date, end_date: date) -> None:
+        """记录当前显示的日期范围（实时成交的可见性判断用）"""
+        self.start_date = start_date
+        self.end_date = end_date
+
+    def set_rows(self, rows: list[dict[str, Any]]) -> None:
+        """整体刷新（查询结果，已按时间倒序）"""
+        # 几千行 × 12 列逐个建单元格很慢，先关掉重绘
+        self.setUpdatesEnabled(False)
+        try:
+            self.setRowCount(0)
+            self.trade_keys.clear()
+
+            for row in rows:
+                self.insert_trade_row(self.rowCount(), row)
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def append_row(self, row: dict[str, Any]) -> None:
+        """实时成交：落在当前日期范围内且未出现过时才插到最上面"""
+        if not self.is_row_in_range(row):
             return
-        self.trade_ids.add(trade.vt_tradeid)
 
-        self.insertRow(0)
+        key: tuple[str, str] = trade_key(row)
+        if key in self.trade_keys:
+            return
 
-        reference: str = getattr(trade, "reference", "")
-        reference_cell: BaseCell = BaseCell(reference, trade)
-        tradeid_cell: BaseCell = BaseCell(trade.tradeid, trade)
-        orderid_cell: BaseCell = BaseCell(trade.orderid, trade)
-        mark_cell: BaseCell = BaseCell(
-            get_order_mark(self.main_engine, trade.vt_orderid),
-            trade
-        )
-        symbol_cell: BaseCell = BaseCell(trade.symbol, trade)
-        name_cell: BaseCell = BaseCell(
-            get_contract_name(self.main_engine, trade.vt_symbol),
-            trade
-        )
-        exchange_cell: EnumCell = EnumCell(trade.exchange, trade)
-        direction_cell: DirectionCell = DirectionCell(trade.direction, trade)
-        price_cell: BaseCell = BaseCell(trade.price, trade)
-        volume_cell: BaseCell = BaseCell(trade.volume, trade)
-        datetime_cell: TradeTimeCell = TradeTimeCell(trade.datetime, trade)
-        gateway_cell: BaseCell = BaseCell(trade.gateway_name, trade)
+        self.insert_trade_row(0, row)
 
-        self.setItem(0, 0, reference_cell)
-        self.setItem(0, 1, tradeid_cell)
-        self.setItem(0, 2, orderid_cell)
-        self.setItem(0, 3, symbol_cell)
-        self.setItem(0, 4, name_cell)
-        self.setItem(0, 5, exchange_cell)
-        self.setItem(0, 6, direction_cell)
-        self.setItem(0, 7, price_cell)
-        self.setItem(0, 8, volume_cell)
-        self.setItem(0, 9, datetime_cell)
-        self.setItem(0, 10, gateway_cell)
-        self.setItem(0, 11, mark_cell)
+    def is_row_in_range(self, row: dict[str, Any]) -> bool:
+        """成交日期是否落在当前显示的区间内"""
+        if self.start_date is None or self.end_date is None:
+            return True
 
-        self.update_row_visible(0)
+        trade_date: Any = row.get("trade_date")
+        if isinstance(trade_date, datetime):
+            trade_date = trade_date.date()
+        if not isinstance(trade_date, date):
+            return True
+
+        return self.start_date <= trade_date <= self.end_date
+
+    def insert_trade_row(self, index: int, row: dict[str, Any]) -> None:
+        """在第 index 行插入一行成交"""
+        self.trade_keys.add(trade_key(row))
+        self.insertRow(index)
+
+        for column, cell in enumerate(self.create_cells(row)):
+            self.setItem(index, column, cell)
+
+        self.update_row_visible(index)
+
+    def create_cells(self, row: dict[str, Any]) -> list[QtWidgets.QTableWidgetItem]:
+        """按列顺序生成单元格（顺序与 TRADE_LABELS 一致）"""
+        return [
+            BaseCell(row.get("reference", ""), row),
+            BaseCell(row.get("tradeid", ""), row),
+            BaseCell(row.get("orderid", ""), row),
+            BaseCell(row.get("symbol", ""), row),
+            BaseCell(row.get("name", ""), row),
+            EnumCell(make_exchange(row), row),
+            DirectionCell(make_direction(row), row),
+            BaseCell(format_number(row.get("price")), row),
+            BaseCell(format_number(row.get("volume")), row),
+            TradeTimeCell(row.get("trade_time"), row),
+            BaseCell(row.get("gateway_name", ""), row),
+            BaseCell(row.get("mark", ""), row),
+        ]
 
     def update_row_visible(self, row: int) -> None:
         """"""

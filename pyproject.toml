@@ -23,6 +23,12 @@ requires-python = ">=3.10"
 dependencies = [
     "vnpy>=4.0.0",
 ]
+
+[project.optional-dependencies]
+# 成交记录落库 / 历史查询需要 SqlApp（vnpy_sqlapp）；不装则模块自动降级为内存模式
+sql = [
+    "vnpy_sqlapp>=1.2.0",
+]
 keywords = ["quant", "quantitative", "investment", "trading", "algotrading"]
 
 [project.urls]

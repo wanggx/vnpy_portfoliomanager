@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Any
 from collections.abc import Callable
 
@@ -23,12 +24,21 @@ from vnpy.trader.object import (
 from vnpy.trader.utility import load_json, save_json
 
 from .base import ContractResult, PortfolioResult, get_trading_day
+from .database import TradeRepository, build_trade_row
+from .settings import SqlSettings, parse_sql_settings
 
 
 APP_NAME = "PortfolioManager"
 
+# SqlApp 的引擎名（vnpy_sqlapp.APP_NAME）。不硬依赖该包，取不到引擎时整体降级。
+try:
+    from vnpy_sqlapp import APP_NAME as SQL_APP_NAME
+except ImportError:
+    SQL_APP_NAME = "SqlApp"
+
 EVENT_PM_CONTRACT = "ePmContract"
 EVENT_PM_PORTFOLIO = "ePmPortfolio"
+# 负载是成交行数据 dict（键见 database.TRADE_COLUMNS）
 EVENT_PM_TRADE = "ePmTrade"
 EVENT_PM_HISTORY = "ePmHistory"
 
@@ -59,6 +69,10 @@ class PortfolioEngine(BaseEngine):
         self.contract_results: dict[tuple[str, str], ContractResult] = {}
         self.portfolio_results: dict[str, PortfolioResult] = {}
 
+        # 成交记录入库配置与仓储；未加载 SqlApp 或建表失败时为 None（降级为内存模式）
+        self.sql_settings: SqlSettings = SqlSettings()
+        self.trade_repository: TradeRepository | None = None
+
         # 历史盈亏快照：reference -> 日期 -> 当日盈亏
         self.history: dict[str, dict[str, dict[str, float]]] = {}
         # 初始资金：reference -> 金额
@@ -76,7 +90,13 @@ class PortfolioEngine(BaseEngine):
         self.load_order()
         self.load_history()
         self.load_data()
+        # 必须在注册事件之前建好仓储：注册之后到达的成交会直接入库
+        self.init_trade_repository()
         self.register_event()
+
+    def write_log(self, msg: str) -> None:
+        """写日志到主引擎（BaseEngine 自身没有 write_log）"""
+        self.main_engine.write_log(msg, self.engine_name)
 
     def register_event(self) -> None:
         """"""
@@ -112,9 +132,14 @@ class PortfolioEngine(BaseEngine):
 
         contract_result.update_trade(trade)
 
-        # 添加成交数据
+        # 落库：失败只记日志，不影响内存记账（仓位与盈亏仍以内存为准）
         trade.reference = reference
-        self.event_engine.put(Event(EVENT_PM_TRADE, trade))
+        row: dict[str, Any] = self.make_trade_row(trade, reference)
+        if self.trade_repository:
+            self.trade_repository.save_row(row)
+
+        # 推送成交数据（行数据，界面与入库共用同一份字段口径）
+        self.event_engine.put(Event(EVENT_PM_TRADE, row))
 
         # 有持仓的合约才需要订阅tick数据
         if self.has_position(vt_symbol):
@@ -196,6 +221,156 @@ class PortfolioEngine(BaseEngine):
             if contract_result.vt_symbol == vt_symbol
         )
 
+    # -- 成交记录入库 -----------------------------------------------------
+
+    def init_trade_repository(self) -> None:
+        """连接 SqlApp 并准备成交记录表；任何一步失败都降级为纯内存模式"""
+        if not self.sql_settings.enabled:
+            self.write_log("成交记录入库已关闭（设置文件中的 sql.enabled = false）")
+            return
+
+        sql_engine: Any = self.main_engine.get_engine(SQL_APP_NAME)
+        if sql_engine is None:
+            self.write_log("未加载 SqlApp，成交记录只保留在内存中，无法查询历史成交")
+            return
+
+        repository: TradeRepository = TradeRepository(
+            sql_engine,
+            self.sql_settings,
+            self.write_log
+        )
+
+        if self.sql_settings.auto_create and not repository.ensure_table():
+            return
+
+        self.trade_repository = repository
+        self.backfill_trades()
+
+    def backfill_trades(self) -> None:
+        """把主引擎已有的成交补写进库（幂等）
+
+        程序当天中途重启时，CTP 登录会把当日成交重推一遍，主引擎里因此已有当日全量
+        成交，这里补写一遍可以覆盖"程序没运行时到达"的那些成交。
+        """
+        if not self.trade_repository:
+            return
+
+        rows: list[dict[str, Any]] = self.get_reference_trade_rows()
+        if not rows:
+            return
+
+        count: int = self.trade_repository.save_rows(rows)
+        self.write_log(f"成交记录入库：新增 {count} 条（当日成交共 {len(rows)} 条，重复的不再写入）")
+
+    def make_trade_row(self, trade: TradeData, reference: str = "") -> dict[str, Any]:
+        """把成交转成行数据（补上合约名称与委托标记的快照）"""
+        if not reference:
+            reference = getattr(trade, "reference", "") or ""
+
+        contract: ContractData | None = self.main_engine.get_contract(trade.vt_symbol)
+        name: str = contract.name if contract else ""
+
+        order: OrderData | None = self.main_engine.get_order(trade.vt_orderid)
+        mark: str = order.mark if order else ""
+
+        return build_trade_row(trade, name=name, mark=mark)
+
+    def get_reference_trade_rows(self) -> list[dict[str, Any]]:
+        """主引擎内存里带组合标记的成交（按时间**倒序**，最新在前）
+
+        只在未接入数据库时作为降级数据源使用：主引擎的成交是纯内存的，重启即失，
+        且网关只会重放当日成交。
+        """
+        rows: list[dict[str, Any]] = []
+
+        for trade in self.main_engine.get_all_trades():
+            reference: str = self.order_reference_map.get(trade.vt_orderid, "")
+            if not reference:
+                continue
+
+            rows.append(self.make_trade_row(trade, reference))
+
+        rows.sort(key=lambda row: row["trade_time"], reverse=True)
+        return rows
+
+    def update_trade_names(self) -> None:
+        """把已加载的合约名称回填到名称为空的历史成交行
+
+        成交入库时合约信息可能还没加载（名称会是空），这里按周期补一次；只更新名称
+        为空的旧行，不覆盖已有的名称快照。
+        """
+        if not self.trade_repository:
+            return
+
+        pairs: list[tuple[str, str]] = []
+        for vt_symbol in {result.vt_symbol for result in self.contract_results.values()}:
+            contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+            if contract and contract.name:
+                pairs.append((vt_symbol, contract.name))
+
+        if pairs:
+            self.trade_repository.update_names(pairs)
+
+    def is_trade_db_ready(self) -> bool:
+        """成交记录是否已接入数据库（未加载 SqlApp 或建表失败时为 False）"""
+        return self.trade_repository is not None
+
+    def query_trades(
+        self,
+        start_date: date,
+        end_date: date,
+        reference: str = "",
+        symbol: str = ""
+    ) -> dict[str, Any]:
+        """按日期范围查询历史成交（供界面后台线程调用，不抛异常）
+
+        返回 ``{"rows": [...], "truncated": bool, "error": str, "db_ready": bool}``；
+        行按时间倒序。Query 失败时 ``error`` 里带原因，界面只展示错误不炸窗口。
+        """
+        if not self.trade_repository:
+            return {"rows": [], "truncated": False, "error": "", "db_ready": False}
+
+        # 取到局部变量：finally 里即使 self.trade_repository 被改也不影响释放
+        repository: TradeRepository = self.trade_repository
+
+        try:
+            rows, truncated = repository.query_range(
+                start_date,
+                end_date,
+                reference,
+                symbol
+            )
+        except Exception as exc:  # noqa: BLE001 - 驱动异常类型由 SqlApp 包装
+            self.write_log(f"查询成交记录失败：{exc}")
+            return {
+                "rows": [],
+                "truncated": False,
+                "error": str(exc),
+                "db_ready": True
+            }
+        finally:
+            # 查询跑在界面的临时线程里，peewee 连接是 thread-local 的，必须在这里释放
+            repository.release_thread_connection()
+
+        return {"rows": rows, "truncated": truncated, "error": "", "db_ready": True}
+
+    def get_trade_filter_options(self) -> tuple[list[str], list[str]]:
+        """数据库里出现过的组合与代码（历史组合也能筛到）
+
+        未接入数据库或查询失败时返回空列表，由界面回退到内存里的成交。
+        """
+        if not self.trade_repository:
+            return [], []
+
+        try:
+            references: list[str] = self.trade_repository.list_references()
+            symbols: list[str] = self.trade_repository.list_symbols()
+        except Exception as exc:  # noqa: BLE001
+            self.write_log(f"读取成交记录筛选项失败：{exc}")
+            return [], []
+
+        return references, symbols
+
     def load_data(self) -> None:
         """读取仓位存档；同一交易日重启时回放当日成交"""
         today: str = get_trading_day()
@@ -273,12 +448,17 @@ class PortfolioEngine(BaseEngine):
         if "capitals" in setting:
             self.capitals = {key: float(value) for key, value in setting["capitals"].items()}
 
+        self.sql_settings = parse_sql_settings(setting)
+
     def save_setting(self) -> None:
-        """"""
-        setting: dict[str, Any] = {
-            "timer_interval": self.timer_interval,
-            "capitals": self.capitals
-        }
+        """写回设置文件
+
+        在原文件基础上合并，而不是整份覆盖：用户可能手写了 ``sql`` 配置（或其他未知
+        字段），直接覆盖会把它们抹掉。
+        """
+        setting: dict[str, Any] = load_json(self.setting_filename)
+        setting["timer_interval"] = self.timer_interval
+        setting["capitals"] = self.capitals
         save_json(self.setting_filename, setting)
 
     def set_capital(self, reference: str, capital: float) -> None:
@@ -323,6 +503,8 @@ class PortfolioEngine(BaseEngine):
         self.save_history()
         self.save_data()
         self.save_order()
+        # 成交入库时合约可能还没加载（名称为空），随周期补一次
+        self.update_trade_names()
 
     def record_daily_result(self, date_str: str) -> None:
         """记录指定日期的盈亏快照，同一日期重复调用会覆盖（未计算过盈亏时跳过）"""
@@ -429,17 +611,3 @@ class PortfolioEngine(BaseEngine):
         """"""
         return self.timer_interval
 
-    def get_all_reference_trades(self) -> list[TradeData]:
-        """获取当日所有带组合标记的成交（按时间升序）"""
-        trades: list[TradeData] = []
-
-        for trade in self.main_engine.get_all_trades():
-            reference: str = self.order_reference_map.get(trade.vt_orderid, "")
-            if not reference:
-                continue
-
-            trade.reference = reference
-            trades.append(trade)
-
-        trades.sort(key=lambda trade: trade.datetime)
-        return trades

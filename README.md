@@ -29,9 +29,10 @@ PortfolioManager是用于交易组合跟踪管理的功能模块，以独立的�
 
 ### 成交记录数据库
 
-成交记录默认落库（需要 [SqlApp](https://github.com/vnpy/vnpy_sqlapp)，即 `vnpy_sqlapp`，
-在 Trader 里要**先于本模块加载**），表名 `vnpy_portfolio_trade`，由 SqlApp 的配置决定
-落到哪个库（`sqlapp.type` / `sqlapp.*`，留空回退到 vn.py 全局 `database.*`）：
+成交记录默认落库（需要 [SqlApp](https://github.com/vnpy/vnpy_sqlapp)，即 `vnpy_sqlapp`），
+表名 `vnpy_portfolio_trade`，由 SqlApp 的配置决定落到哪个库（`sqlapp.type` / `sqlapp.*`，
+留空回退到 vn.py 全局 `database.*`）。**读写都只走 SqlApp**：不自己建连接，成交记录也
+不从内存/文件里读：
 
 - 表在模块启动时自动创建（`CREATE TABLE IF NOT EXISTS`），不建时会把
   `sql` 里的 `auto_create` 置为 `false`，改用手工执行 `script/create_vnpy_portfolio_trade.sql`；
@@ -39,7 +40,10 @@ PortfolioManager是用于交易组合跟踪管理的功能模块，以独立的�
 - 唯一键是 `(trade_date, vt_tradeid)`：CTP 的 `TradeID` 只在当个交易日内唯一、跨日会重复，
   所以不能只用 `vt_tradeid` 做唯一键；
 - 写入是幂等的：重启、CTP 登录重放当日成交、当日成交回放都不会重复计数；
-- 未加载 SqlApp 时自动降级：成交只留在内存（只显示当日，重启即失），状态栏会提示。
+- 连库时机是**界面打开时**（不要求 SqlApp 的加载顺序）：引擎构造时 SqlApp 可能还没加载
+  （Station 里它排在 PortfolioManager 之后），所以连库推后在界面打开时做，那时 SqlApp 一定在；
+- 未加载 SqlApp（或建表失败）时：成交不入库，成交记录页为空并提示
+  "未接入 SqlApp：成交记录只从 SqlApp 读取，当前无法显示"，交易记账不受影响。
 
 可在 `portfolio_manager_setting.json` 里配置（默认值不落盘）：
 
@@ -74,7 +78,7 @@ PortfolioManager是用于交易组合跟踪管理的功能模块，以独立的�
 
 安装环境推荐基于4.0.0版本以上的【[**VeighNa Studio**](https://www.vnpy.com)】。
 
-成交记录落库需要额外安装 `vnpy_sqlapp`（可选，不装则自动降级为内存模式）：
+成交记录落库需要额外安装 `vnpy_sqlapp`（可选，不装则成交记录页不可用、成交不入库）：
 
 ```
 pip install vnpy_sqlapp

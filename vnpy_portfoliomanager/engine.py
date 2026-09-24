@@ -74,6 +74,8 @@ class PortfolioEngine(BaseEngine):
         # 成交记录入库配置与仓储；未加载 SqlApp 或建表失败时为 None（降级为内存模式）
         self.sql_settings: SqlSettings = SqlSettings()
         self.trade_repository: TradeRepository | None = None
+        # 只报一次的日志：延迟初始化会被反复调用，同一句话别刷屏
+        self.warned_messages: set[str] = set()
 
         # 历史盈亏快照：reference -> 日期 -> 当日盈亏
         self.history: dict[str, dict[str, dict[str, float]]] = {}
@@ -92,13 +94,22 @@ class PortfolioEngine(BaseEngine):
         self.load_order()
         self.load_history()
         self.load_data()
-        # 必须在注册事件之前建好仓储：注册之后到达的成交会直接入库
-        self.init_trade_repository()
+        # 成交库**不在这里连**：此刻 SqlApp 常常还没加载（Station 按 APP_INFO 顺序加载应用，
+        # SqlApp 排在 PortfolioManager 之后），现在连只会白白降级成内存模式。连库交给
+        # 使用方：界面打开时调 init_trade_repository()，无界面时由首笔成交兜底。
         self.register_event()
 
     def write_log(self, msg: str) -> None:
         """写日志到主引擎（BaseEngine 自身没有 write_log）"""
         self.main_engine.write_log(msg, self.engine_name)
+
+    def write_log_once(self, msg: str) -> None:
+        """同一句话只写一次（延迟初始化的降级路径会被反复走到）"""
+        if msg in self.warned_messages:
+            return
+
+        self.warned_messages.add(msg)
+        self.write_log(msg)
 
     def register_event(self) -> None:
         """"""
@@ -152,8 +163,15 @@ class PortfolioEngine(BaseEngine):
         # 落库：失败只记日志，不影响内存记账（仓位与盈亏仍以内存为准）
         trade.reference = reference
         row: dict[str, Any] = self.make_trade_row(trade, reference)
-        if self.trade_repository:
-            self.trade_repository.save_row(row)
+        # 首笔成交时连库（延迟初始化）：此时所有应用都已加载完，SqlApp 一定在
+        self.init_trade_repository()
+
+        if not self.trade_repository:
+            # 成交记录**只能从 SqlApp 读**：这条成交没进库，就不要推给界面，
+            # 否则界面会显示一份“库里查不到”的成交
+            return
+
+        self.trade_repository.save_row(row)
 
         # 推送成交数据（行数据，界面与入库共用同一份字段口径）
         self.event_engine.put(Event(EVENT_PM_TRADE, row))
@@ -240,16 +258,30 @@ class PortfolioEngine(BaseEngine):
 
     # -- 成交记录入库 -----------------------------------------------------
 
-    def init_trade_repository(self) -> None:
-        """连接 SqlApp 并准备成交记录表；任何一步失败都降级为纯内存模式"""
+    def init_trade_repository(self) -> bool:
+        """连接 SqlApp 并准备成交记录表；连上返回 True，否则降级为纯内存模式
+
+        **由使用方在合适的时机显式调用**（照 portfoliostrategy 的路子：界面打开时调
+        ``init_engine()``），不在引擎构造时连库——Station 按 ``APP_INFO`` 顺序加载应用，
+        ``SqlApp`` 排在 ``PortfolioManager`` 之后，构造时 ``get_engine("SqlApp")``
+        必然拿不到，过早初始化只会把整个会话锁死在内存模式。
+
+        当前调用点：界面 ``init_data()``（界面打开）、``process_trade_event()``（无界面
+        或首笔成交先到时兜底）。
+
+        幂等且可重试：已连上直接返回 True；失败不缓存结果，下次调用还会再试。
+        """
+        if self.trade_repository is not None:
+            return True
+
         if not self.sql_settings.enabled:
-            self.write_log("成交记录入库已关闭（设置文件中的 sql.enabled = false）")
-            return
+            self.write_log_once("成交记录入库已关闭（设置文件中的 sql.enabled = false）")
+            return False
 
         sql_engine: Any = self.main_engine.get_engine(SQL_APP_NAME)
         if sql_engine is None:
-            self.write_log("未加载 SqlApp，成交记录只保留在内存中，无法查询历史成交")
-            return
+            self.write_log_once("未加载 SqlApp，成交记录只保留在内存中，无法查询历史成交")
+            return False
 
         repository: TradeRepository = TradeRepository(
             sql_engine,
@@ -258,10 +290,11 @@ class PortfolioEngine(BaseEngine):
         )
 
         if self.sql_settings.auto_create and not repository.ensure_table():
-            return
+            return False
 
         self.trade_repository = repository
         self.backfill_trades()
+        return True
 
     def backfill_trades(self) -> None:
         """把主引擎已有的成交补写进库（幂等）
@@ -295,8 +328,8 @@ class PortfolioEngine(BaseEngine):
     def get_reference_trade_rows(self) -> list[dict[str, Any]]:
         """主引擎内存里带组合标记的成交（按时间**倒序**，最新在前）
 
-        只在未接入数据库时作为降级数据源使用：主引擎的成交是纯内存的，重启即失，
-        且网关只会重放当日成交。
+        只用于**连库成功时的回补**（`backfill_trades`）：把内存模式期间（或程序没运行、
+        由网关重放）的成交补写进库。界面不再用它——成交记录**只从 SqlApp 读**。
         """
         rows: list[dict[str, Any]] = []
 
@@ -329,7 +362,11 @@ class PortfolioEngine(BaseEngine):
             self.trade_repository.update_names(pairs)
 
     def is_trade_db_ready(self) -> bool:
-        """成交记录是否已接入数据库（未加载 SqlApp 或建表失败时为 False）"""
+        """成交记录是否已接入数据库（未加载 SqlApp 或建表失败时为 False）
+
+        纯查询，**不带副作用**：连库由界面打开（界面里调 ``init_trade_repository()``，
+        与 portfoliostrategy 的 ``widget -> engine.init_engine()`` 一致）或首笔成交触发。
+        """
         return self.trade_repository is not None
 
     def query_trades(
@@ -343,6 +380,9 @@ class PortfolioEngine(BaseEngine):
 
         返回 ``{"rows": [...], "truncated": bool, "error": str, "db_ready": bool}``；
         行按时间倒序。Query 失败时 ``error`` 里带原因，界面只展示错误不炸窗口。
+
+        连库由调用方先调 ``init_trade_repository()``（界面打开时已经连过），
+        这里不再隐式触发。
         """
         if not self.trade_repository:
             return {"rows": [], "truncated": False, "error": "", "db_ready": False}
@@ -374,7 +414,7 @@ class PortfolioEngine(BaseEngine):
     def get_trade_filter_options(self) -> tuple[list[str], list[str]]:
         """数据库里出现过的组合与代码（历史组合也能筛到）
 
-        未接入数据库或查询失败时返回空列表，由界面回退到内存里的成交。
+        未接入数据库或查询失败时返回空列表（界面不再回退到内存里的成交）。
         """
         if not self.trade_repository:
             return [], []

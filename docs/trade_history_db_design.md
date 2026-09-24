@@ -167,10 +167,14 @@ class TradeRepository:
 
 `engine.py`：
 
-- `__init__` 里 `sql_engine = main_engine.get_engine("SqlApp")`，拿不到就整体降级
-  （`self.trade_repository = None`），模块照常工作，只是没有历史查询；
-- 在 `load_data()` 之后、`register_event()` 之前调 `init_trade_repository()`（建表 +
-  回补当日成交），保证之后到达的实时成交一律入库；
+- 引擎**构造时不连库**：`SqlApp` 在 Station 里排在 `PortfolioManager` 之后加载，此时
+  `main_engine.get_engine("SqlApp")` 必然拿不到，过早初始化只会白白降级成内存模式；
+- `init_trade_repository()` 改为由**使用方在合适时机显式调用**（幂等、失败可重试），当前两个
+  调用点：界面 `init_data()`（界面打开，与 portfoliostrategy 的 `widget -> engine.init_engine()`
+  一致）、`process_trade_event()`（无界面或首笔成交先到时兜底）；连库成功时建表 +
+  回补内存里的当日成交，之后到达的实时成交直接入库；
+- 连不上时整体降级（`self.trade_repository = None`），模块照常工作，只是没有历史查询；
+  降级告警只写一次（`write_log_once()`），不会随每次重试刷屏；
 - `process_trade_event()` 里在 `update_trade()` 之后落库，**再**推 `EVENT_PM_TRADE`；
   事件负载因此改成行数据 dict（键见 `TRADE_COLUMNS`），界面与入库共用同一套字段口径；
 - `save_history_periodically()` 里额外调 `update_trade_names()`，把入库时还没加载到的
@@ -182,11 +186,10 @@ class TradeRepository:
 
 ## 5. UI 侧改动（成交记录页）
 
-顶部工具条改为：
+顶部工具条并为**一行**（筛选项靠左、日期与查询靠右）：
 
 ```
-[起始日期 ▾][结束日期 ▾] [今天][近一周][近一月][全部] [查询]
-[组合 ▾][合约 ▾][清空筛选]                          [导出CSV]
+[组合 ▾][合约 ▾][清空筛选]     [日期 ▾]~[日期 ▾][今天][近一周][近一月][全部][查询][导出CSV]
 状态：共 N 条  或  已显示前 5000 条，请缩小日期范围
 ```
 
@@ -198,8 +201,10 @@ class TradeRepository:
   当前查询区间，落在就插一行（保持日内实时感）；
 - 组合/合约下拉选项改为从 DB 的 `DISTINCT` 取（历史组合也能筛），保留本地过滤逻辑兜底；
 - 「导出CSV」导出当前表格内容（即当前查询结果，仍是只导可见行）；
-- SqlApp 未加载时：表格退回内存里的当日成交，状态栏提示"未加载 SqlApp，仅显示当日内存成交，
-  无法查询历史"（日期控件保持可点，只是不生效）。
+- SqlApp 未加载（或建表失败）时：成交记录页**为空**，状态栏提示"未接入 SqlApp：成交记录
+  只从 SqlApp 读取，当前无法显示"；不做内存降级——成交记录的唯一数据源就是 SqlApp。
+  连库时机是**界面打开**（`widget.init_data()` 调 `engine.init_trade_repository()`），
+  而不是引擎构造。
 
 实现要点：
 
@@ -220,7 +225,7 @@ class TradeRepository:
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `sql.enabled` | `true` | 关掉则完全退回内存模式 |
+| `sql.enabled` | `true` | 关掉则完全不落库，成交记录页为空 |
 | `sql.table` | `vnpy_portfolio_trade` | 表名（白名单校验后拼接） |
 | `sql.auto_create` | `true` | 启动自动 `CREATE TABLE IF NOT EXISTS` |
 | `sql.max_rows` | `5000` | 单次查询行数上限 |
@@ -249,13 +254,13 @@ class TradeRepository:
 | `vnpy_portfoliomanager/settings.py` | 新增：`SqlSettings` 与标识符白名单校验 |
 | `vnpy_portfoliomanager/engine.py` | 接 SqlApp（可缺失降级）、`init_trade_repository()`、`backfill_trades()`、`query_trades()`、`get_trade_filter_options()`、`update_trade_names()`；`save_setting()` 改为合并写入 |
 | `vnpy_portfoliomanager/base.py` | 未改动（记账口径不变） |
-| `vnpy_portfoliomanager/ui/widget.py` | 日期范围控件与快捷区间、后台查询线程、表格改为整体刷新 + 实时插入、CSV 导出、降级提示 |
+| `vnpy_portfoliomanager/ui/widget.py` | 日期范围控件与快捷区间、后台查询线程、表格改为整体刷新 + 实时插入、CSV 导出、未接入 SqlApp 的提示 |
 | `script/create_vnpy_portfolio_trade.sql` | 新增：建表脚本（与代码生成的 DDL 一致） |
 | `docs/trade_history_db_design.md` | 本文档 |
 | `README.md` / `CHANGELOG.md` / `pyproject.toml` | 依赖、用法、版本说明 |
 
 已做的验证：真 MySQL 建表/幂等写入/范围查询冒烟测试；Qt 端到端测试（实时插入、
-日期范围切换、按组合筛选、筛选项刷新、未加载 SqlApp 的降级路径）。
+日期范围切换、按组合筛选、筛选项刷新、未接入 SqlApp 时表格为空 + 提示）。
 
 ## 9. 风险与已知取舍
 

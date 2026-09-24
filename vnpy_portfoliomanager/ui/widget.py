@@ -309,18 +309,6 @@ class PortfolioManager(QtWidgets.QWidget):
             lambda: self.set_trade_date_range(TRADE_ALL_START_DATE, date.today())
         )
 
-        range_layout: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
-        range_layout.addWidget(QtWidgets.QLabel("日期"))
-        range_layout.addWidget(self.trade_start_date)
-        range_layout.addWidget(QtWidgets.QLabel("~"))
-        range_layout.addWidget(self.trade_end_date)
-        range_layout.addWidget(today_button)
-        range_layout.addWidget(week_button)
-        range_layout.addWidget(month_button)
-        range_layout.addWidget(all_button)
-        range_layout.addWidget(self.trade_query_button)
-        range_layout.addStretch()
-
         # 组合/合约改为服务端查询条件，可选项来自库里出现过的值
         self.trade_reference_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.trade_reference_combo.setMinimumWidth(140)
@@ -338,6 +326,7 @@ class PortfolioManager(QtWidgets.QWidget):
         export_button: QtWidgets.QPushButton = QtWidgets.QPushButton("导出CSV")
         export_button.clicked.connect(self.export_trades)
 
+        # 一行布局：组合/合约等筛选项靠左，日期范围与查询/导出靠右
         filter_layout: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         filter_layout.addWidget(QtWidgets.QLabel("组合"))
         filter_layout.addWidget(self.trade_reference_combo)
@@ -345,12 +334,20 @@ class PortfolioManager(QtWidgets.QWidget):
         filter_layout.addWidget(self.trade_symbol_combo)
         filter_layout.addWidget(clear_button)
         filter_layout.addStretch()
+        filter_layout.addWidget(QtWidgets.QLabel("日期"))
+        filter_layout.addWidget(self.trade_start_date)
+        filter_layout.addWidget(QtWidgets.QLabel("~"))
+        filter_layout.addWidget(self.trade_end_date)
+        filter_layout.addWidget(today_button)
+        filter_layout.addWidget(week_button)
+        filter_layout.addWidget(month_button)
+        filter_layout.addWidget(all_button)
+        filter_layout.addWidget(self.trade_query_button)
         filter_layout.addWidget(export_button)
 
         self.trade_status_label: QtWidgets.QLabel = QtWidgets.QLabel()
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
-        vbox.addLayout(range_layout)
         vbox.addLayout(filter_layout)
         vbox.addWidget(self.trade_status_label)
         vbox.addWidget(self.monitor)
@@ -421,14 +418,17 @@ class PortfolioManager(QtWidgets.QWidget):
         self.refresh_trades()
 
     def refresh_trades(self) -> None:
-        """按当前日期范围与筛选条件重查成交记录"""
+        """按当前日期范围与筛选条件重查成交记录（**只从 SqlApp 读**）"""
         if not self.portfolio_engine.is_trade_db_ready():
-            # 未加载 SqlApp：退回主引擎内存里的当日成交（没有历史可查）
+            # 成交记录的唯一数据源是 SqlApp：没接上就不显示任何成交，
+            # 也不回退到主引擎内存（那不是成交记录的可靠来源）
             self.trade_query_running = False
             self.trade_pending_rows = []
             self.monitor.set_range(date.min, date.max)
-            self.monitor.set_rows(self.portfolio_engine.get_reference_trade_rows())
-            self.trade_status_label.setText("未加载 SqlApp，仅显示当日内存成交，无法查询历史")
+            self.monitor.set_rows([])
+            self.trade_status_label.setText(
+                "未接入 SqlApp：成交记录只从 SqlApp 读取，当前无法显示"
+            )
             return
 
         start, end = self.get_trade_date_range()
@@ -506,7 +506,10 @@ class PortfolioManager(QtWidgets.QWidget):
             self.trade_status_label.setText(f"共 {len(rows)} 条成交记录")
 
     def init_trade_filter_options(self) -> None:
-        """初始化筛选下拉框：优先取库里出现过的组合/合约（历史组合也能筛到）"""
+        """初始化筛选下拉框：取库里出现过的组合/合约（历史组合也能筛到）
+
+        可选项也只来自 SqlApp：没有库里侧的记录就不给选项，避免选出空结果。
+        """
         references, symbols = self.portfolio_engine.get_trade_filter_options()
 
         for reference in references:
@@ -516,10 +519,6 @@ class PortfolioManager(QtWidgets.QWidget):
         for symbol in symbols:
             if self.trade_symbol_combo.findData(symbol) < 0:
                 self.trade_symbol_combo.addItem(symbol, symbol)
-
-        # 未接入数据库时至少把内存里的成交塞进去
-        for row in self.portfolio_engine.get_reference_trade_rows():
-            self.add_trade_filter_option(row)
 
     def register_event(self) -> None:
         """"""
@@ -535,7 +534,14 @@ class PortfolioManager(QtWidgets.QWidget):
         self.event_engine.register(EVENT_PM_HISTORY, self.signal_history.emit)
 
     def init_data(self) -> None:
-        """初始化成交记录与历史盈亏"""
+        """初始化成交记录与历史盈亏（顺带把成交库连上）
+
+        连库放在**界面打开时**做（照 portfoliostrategy：界面里调 ``engine.init_engine()``）：
+        Station 按 ``APP_INFO`` 顺序加载应用，SqlApp 排在 PortfolioManager 之后，
+        引擎构造时它还没注册，那时连库只会白白降级成内存模式。走到这里，所有应用
+        都已加载完，SqlApp 一定在。
+        """
+        self.portfolio_engine.init_trade_repository()
         self.init_trade_filter_options()
         self.refresh_trades()
         self.update_history(self.portfolio_engine.get_history_data())
@@ -613,13 +619,14 @@ class PortfolioManager(QtWidgets.QWidget):
         self.update_item_color(portfolio_item, portfolio_result)
 
     def process_trade_event(self, event: Event) -> None:
-        """"""
+        """实时成交：只有入库成功的成交才会被推送过来（引擎侧把关）"""
         row: dict[str, Any] = event.data
 
         self.monitor.append_row(row)
         self.add_trade_filter_option(row)
         if self.trade_query_running:
             self.trade_pending_rows.append(row)
+
     def process_history_event(self, event: Event) -> None:
         """"""
         self.update_history(event.data)

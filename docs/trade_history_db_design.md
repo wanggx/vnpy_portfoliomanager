@@ -101,7 +101,7 @@ sqlite / postgresql 的差异（**当前不支持**，见第 7 节）：
 | `trade_date` | `trade_time` 取日期部分 | 独立成列，范围查询可直接走索引，避免 `DATE(trade_time)` 导致索引失效 + SQL 里做时区换算 |
 | `reference` | `getattr(trade, "reference", "")` | vnpy 4.4 的 `TradeData` 是 dataclass，`reference` 由本模块动态挂上 |
 | `name` | `main_engine.get_contract(vt_symbol).name` | **写入时快照**：历史查询不能依赖主引擎（合约可能退市/改名/当时未加载） |
-| `mark` | `main_engine.get_order(vt_orderid).mark` | 同上，`TradeData` 没有 mark，隔日重启后取不到，必须写入时快照 |
+| `mark` | `engine.order_mark_map[vt_orderid]`（缺失时退回 `main_engine.get_order(vt_orderid).mark`） | `TradeData` 没有 mark；且很多网关（XT/QMT）在后续委托回报里重建 `OrderData` 时会丢掉 mark，所以引擎在委托事件里缓存并在重启后从 `portfolio_manager_order.json` 的 `marks` 字段还原，必须写入时快照 |
 | `price` / `volume` | `trade.price` / `trade.volume` | 用 `DECIMAL` 而非 `DOUBLE`：金额/数量定点存储，避免浮点误差 |
 | 其余 | `trade.*` / `trade.vt_*` | 直接落库 |
 

@@ -581,14 +581,35 @@ class PortfolioManager(QtWidgets.QWidget):
 
         return contract_item
 
+    def hide_contract_item(self, reference: str, vt_symbol: str) -> None:
+        """清仓后隐藏明细行（只隐藏不删除，重新建仓时原样复用）"""
+        contract_item: QtWidgets.QTreeWidgetItem | None = self.contract_items.get(
+            (reference, vt_symbol),
+            None
+        )
+        if contract_item:
+            contract_item.setHidden(True)
+
     def process_contract_event(self, event: Event) -> None:
         """"""
         contract_result: dict = event.data
+
+        # 已清仓（持仓 0）的合约隐藏该行：清仓当日那笔已实现盈亏仍计在上层的组合行与
+        # 汇总表里，但明细里不再占一行——否则交易过的标的会越堆越多（跨日还会从存档里
+        # 冒出来）。只隐藏不删除，重新建仓时原样复用。
+        if not contract_result["last_pos"]:
+            self.hide_contract_item(
+                contract_result["reference"],
+                contract_result["vt_symbol"]
+            )
+            return
 
         contract_item: QtWidgets.QTreeWidgetItem = self.get_contract_item(
             contract_result["reference"],
             contract_result["vt_symbol"]
         )
+        # 之前清仓隐藏过，重新建仓时再显示出来
+        contract_item.setHidden(False)
 
         # 合约信息可能比成交晚加载，名称空缺时每次推送都补一下
         if not contract_item.text(2):

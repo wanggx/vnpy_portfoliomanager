@@ -66,6 +66,11 @@ class PortfolioEngine(BaseEngine):
         self.subscribed: set[str] = set()
         self.result_symbols: set[str] = set()
         self.order_reference_map: dict[str, str] = {}
+        # vt_orderid -> 委托标记（mark）快照。与 order_reference_map 同理：不少网关
+        # （XT/QMT 等）在后续的委托状态回报里会重建 OrderData 并把 mark 丢掉，而成交
+        # 记录的"标记"列取自委托，必须在这里补回；同时落盘，进程重启后网关回放的委托
+        # 同样没有 mark，靠存档还原。
+        self.order_mark_map: dict[str, str] = {}
         # 已经告警过的"无组合标记"成交，避免重复推送时刷屏
         self.unmatched_tradeids: set[str] = set()
         self.contract_results: dict[tuple[str, str], ContractResult] = {}
@@ -133,6 +138,15 @@ class PortfolioEngine(BaseEngine):
         elif reference:
             # 后续推送没带 reference：用本地缓存补回，别的引擎/界面也要读这个字段
             order.reference = reference
+
+        # mark 同理：委托回报里常常没有这个字段（XT 的 on_stock_order 是重新 new 了
+        # 一个 OrderData），必须用本地缓存补回，否则成交记录的"标记"列会是空的——
+        # 成交是最后一步，等它到达时再补就已经晚了。
+        mark: str = self.order_mark_map.get(order.vt_orderid, "")
+        if order.mark:
+            self.order_mark_map[order.vt_orderid] = order.mark
+        elif mark:
+            order.mark = mark
 
     def process_trade_event(self, event: Event) -> None:
         """"""
@@ -320,8 +334,12 @@ class PortfolioEngine(BaseEngine):
         contract: ContractData | None = self.main_engine.get_contract(trade.vt_symbol)
         name: str = contract.name if contract else ""
 
-        order: OrderData | None = self.main_engine.get_order(trade.vt_orderid)
-        mark: str = order.mark if order else ""
+        # mark 以本地缓存为准（见 order_mark_map）：重启后网关回放的委托没有 mark，
+        # 但存档里有；缓存缺失（例如模块启动之前就下过的单）时才退回主引擎的委托对象。
+        mark: str = self.order_mark_map.get(trade.vt_orderid, "")
+        if not mark:
+            order: OrderData | None = self.main_engine.get_order(trade.vt_orderid)
+            mark = order.mark if order else ""
 
         return build_trade_row(trade, name=name, mark=mark)
 
@@ -499,7 +517,12 @@ class PortfolioEngine(BaseEngine):
         """"""
         data: dict[str, Any] = {"date": get_trading_day()}
 
-        for contract_result in self.contract_results.values():
+        for contract_result in self.contract_results.values():            # 清仓（持仓 0）的合约不落盘：没有仓位就没有隔日要恢复的东西，留着只会让
+            # 存档随交易过的标的越积越多，次日还会从存档里冒出一堆 0 仓行。
+            # 注意不能从 contract_results 里删：清仓当日那笔已实现盈亏还在它身上，
+            # 删了会让组合当日盈亏变小。
+            if not contract_result.last_pos:
+                continue
             key: str = f"{contract_result.reference},{contract_result.vt_symbol}"
             data[key] = {
                 "open_pos": contract_result.open_pos,
@@ -662,25 +685,43 @@ class PortfolioEngine(BaseEngine):
         today: str = get_trading_day()
         if date == today:
             self.order_reference_map = order_data["data"]
+            # 旧版存档没有 marks 字段，取不到就是空表
+            self.order_mark_map = order_data.get("marks", {}) or {}
 
     def save_order(self) -> None:
         """"""
-        # 只落盘有效映射：空串是"这一笔没拿到 reference"的占位，写进去会把上次留下的
-        # 好映射覆盖掉（同一天早先实例存的映射是成交归属的唯一恢复来源）。
+        today: str = get_trading_day()
+        existing: dict = load_json(self.order_filename)
+
+        # 合并写入（同一天早先实例存下的映射是成交归属/标记的唯一恢复来源）：先取回
+        # 今天已落盘的有效项，再用当前内存里的非空项覆盖，谁都不丢。
+        same_day: bool = existing.get("date") == today
         data: dict[str, str] = {
             key: value
-            for key, value in self.order_reference_map.items()
+            for key, value in (existing.get("data") or {}).items()
             if value
-        }
+        } if same_day else {}
+        marks: dict[str, str] = {
+            key: value
+            for key, value in (existing.get("marks") or {}).items()
+            if value
+        } if same_day else {}
 
-        if not data:
-            existing: dict = load_json(self.order_filename)
-            if existing.get("date") == get_trading_day() and existing.get("data"):
-                return
+        # 空串是"这一笔没拿到 reference / mark"的占位，写进去会把上次留下的好映射覆盖掉
+        data.update(
+            (key, value) for key, value in self.order_reference_map.items() if value
+        )
+        marks.update(
+            (key, value) for key, value in self.order_mark_map.items() if value
+        )
+
+        if not data and not marks:
+            return
 
         order_data: dict[str, Any] = {
-            "date": get_trading_day(),
-            "data": data
+            "date": today,
+            "data": data,
+            "marks": marks,
         }
         save_json(self.order_filename, order_data)
 

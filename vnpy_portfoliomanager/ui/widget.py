@@ -582,7 +582,10 @@ class PortfolioManager(QtWidgets.QWidget):
         return contract_item
 
     def hide_contract_item(self, reference: str, vt_symbol: str) -> None:
-        """清仓后隐藏明细行（只隐藏不删除，重新建仓时原样复用）"""
+        """隐藏明细行：引擎清理已平仓的合约时下发 ``cleared`` 事件
+
+        只隐藏不删除，重新建仓时原样复用。
+        """
         contract_item: QtWidgets.QTreeWidgetItem | None = self.contract_items.get(
             (reference, vt_symbol),
             None
@@ -594,10 +597,12 @@ class PortfolioManager(QtWidgets.QWidget):
         """"""
         contract_result: dict = event.data
 
-        # 已清仓（持仓 0）的合约隐藏该行：清仓当日那笔已实现盈亏仍计在上层的组合行与
-        # 汇总表里，但明细里不再占一行——否则交易过的标的会越堆越多（跨日还会从存档里
-        # 冒出来）。只隐藏不删除，重新建仓时原样复用。
-        if not contract_result["last_pos"]:
+        # 已平仓（持仓 0）的合约要等**下一个交易日**才从明细里清掉，与 A 股持仓显示口径
+        # 一致：当日平仓的标的当天仍显示一条 0 仓记录（清仓那笔已实现盈亏照旧计在上层的
+        # 组合行与汇总表里）。清理由引擎在交易日切换时下发 ``cleared`` 标记——那时记录
+        # 已被引擎删除、不再推周期数据，界面没法自己判断。
+        # 只隐藏不删除，重新建仓时原样复用。
+        if contract_result.get("cleared"):
             self.hide_contract_item(
                 contract_result["reference"],
                 contract_result["vt_symbol"]

@@ -457,6 +457,11 @@ class PortfolioEngine(BaseEngine):
         for key, d in data.items():
             reference, vt_symbol = key.split(",", 1)
 
+            # 上一日已平仓（收盘 0 仓）的合约直接丢掉：A 股口径下平仓当天仍要显示，
+            # 清理留到下一个交易日，所以存档里还留着它们（见 save_data）。
+            if date_changed and not d["last_pos"]:
+                continue
+
             # 跨交易日：把上一日收盘仓位作为今日开盘仓位
             pos: float = d["last_pos"] if date_changed else d["open_pos"]
 
@@ -517,12 +522,13 @@ class PortfolioEngine(BaseEngine):
         """"""
         data: dict[str, Any] = {"date": get_trading_day()}
 
-        for contract_result in self.contract_results.values():            # 清仓（持仓 0）的合约不落盘：没有仓位就没有隔日要恢复的东西，留着只会让
-            # 存档随交易过的标的越积越多，次日还会从存档里冒出一堆 0 仓行。
-            # 注意不能从 contract_results 里删：清仓当日那笔已实现盈亏还在它身上，
-            # 删了会让组合当日盈亏变小。
-            if not contract_result.last_pos:
-                continue
+        # 当日平仓（持仓 0）的合约**照样落盘**：与 A 股持仓显示口径一致，平仓当天明细里
+        # 仍要有这条 0 仓记录，同一交易日重启后也一样。清理留到下一个交易日，由
+        # load_data() 跨日载入时丢弃、check_date_change() 从内存里删掉，所以存档不会
+        # 随交易过的标的越积越多。
+        # 注意这里不能反过来把 0 仓的 contract_result 删掉：清仓当日那笔已实现盈亏还在
+        # 它身上，删了会让组合当日盈亏变小。
+        for contract_result in self.contract_results.values():
             key: str = f"{contract_result.reference},{contract_result.vt_symbol}"
             data[key] = {
                 "open_pos": contract_result.open_pos,
@@ -659,7 +665,7 @@ class PortfolioEngine(BaseEngine):
         return data
 
     def check_date_change(self) -> None:
-        """检测交易日切换：归档前一日结果，并把收盘仓位滚动为新的开盘仓位
+        """检测交易日切换：归档前一日结果，滚动收盘仓位，并清理已平仓的合约
 
         交易日按自然日（遇周末顺延），本地以 A 股为主、没有夜盘，所以不再把 20:00
         之后算作下一个交易日。
@@ -674,8 +680,32 @@ class PortfolioEngine(BaseEngine):
         for contract_result in self.contract_results.values():
             contract_result.roll_to_next_day()
 
+        self.clear_flat_contracts()
+
         self.save_data()
         self.save_history()
+
+    def clear_flat_contracts(self) -> None:
+        """清掉已平仓（持仓 0）的合约记录，并通知界面隐藏对应明细行
+
+        平仓当天**不清理**：与 A 股持仓显示口径一致，当日平仓的标的当天仍要在明细里
+        显示一条 0 仓记录，到下一个交易日才消失。所以这个动作放在交易日切换时，且必须
+        在 record_daily_result() 之后——清仓当日那笔已实现盈亏这时已经写进历史快照，
+        此刻删掉不会让前一日的组合盈亏变小（新的一天本来也不该再累计它）。
+
+        界面侧只 ``setHidden(True)``（不删控件，重新建仓时原样复用），因此必须显式下发
+        ``cleared`` 标记：记录删掉之后引擎不会再推这个合约的周期数据，界面无从自己判断。
+        """
+        for key in list(self.contract_results.keys()):
+            contract_result: ContractResult = self.contract_results[key]
+            if contract_result.last_pos:
+                continue
+
+            del self.contract_results[key]
+
+            data: dict = contract_result.get_data()
+            data["cleared"] = True
+            self.event_engine.put(Event(EVENT_PM_CONTRACT, data))
 
     def load_order(self) -> None:
         """"""

@@ -6,6 +6,11 @@
    据此隐藏该行（只隐藏控件，重新建仓时原样复用）
 2. 仓位存档同步这个口径：当日平仓的合约**照样落盘**（同一交易日重启后明细行还在，
    靠当日成交回放重建盈亏），跨交易日载入时丢弃——存档仍不会随交易过的标的越积越多
+3. 成交记录表的 DDL 与写入语句**按 SqlApp 当前驱动生成**（mysql / postgresql / sqlite /
+   duckdb）：`sqlapp.type` 切到 DuckDB 后不再套用 MySQL 的 `AUTO_INCREMENT` / `ENGINE` /
+   `KEY` 语法（原来直接报 `Parser Error: syntax error at or near "AUTO_INCREMENT"`）。
+   duckdb 用 `id` 序列作默认值 + 独立 `CREATE INDEX`，幂等写入改用 `ON CONFLICT DO NOTHING`，
+   `sqlite` 用 `?` 占位符，mysql/postgresql 行为不变
 
 # 1.3.1版本
 

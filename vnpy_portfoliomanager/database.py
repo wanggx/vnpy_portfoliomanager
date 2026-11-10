@@ -3,9 +3,12 @@
 只依赖 SqlApp 公开的 ``SqlEngine`` 接口（``query`` / ``execute``），不自己建连接、
 不碰 SQLApp 内部实现——与 ``vnpy_patternsearch`` 的 sqlapp 数据源做法一致。
 
-方言固定为 **MySQL**（当前 ``sqlapp.type = mysql``）：反引号标识符、``%s`` 占位符、
-``ON DUPLICATE KEY UPDATE`` 幂等写入。SqlApp 明确不做 SQL 方言转换，换成
-sqlite/postgresql 需要改本文件的 DDL 与写入语句。
+方言跟随 SqlApp 当前的驱动（``sql_engine.database.driver_name``），支持
+mysql / postgresql / sqlite / duckdb 四种：mysql、postgresql 用 ``%s`` 占位符，
+sqlite、duckdb 用 ``?``；幂等写入 mysql 走 ``ON DUPLICATE KEY UPDATE``，其余走
+``ON CONFLICT``；DDL 也按方言生成（duckdb 没有 ``AUTO_INCREMENT``、列内
+``COMMENT``、``ENGINE`` 与 ``KEY`` 定义，改用 ``id`` 序列 + 独立建索引）。
+SqlApp 明确不做 SQL 方言转换，所以方言分支写在本文件里。
 
 时间口径：vnpy 的 ``trade.datetime`` 是带时区的 UTC，入库前统一转成**本地时区**的
 naive datetime（与 vnpy ``TimeCell`` 的显示口径一致，即系统时区）。表中同时保留
@@ -58,7 +61,45 @@ COLUMN_DEFINITIONS: list[tuple[str, str, str]] = [
 
 TRADE_COLUMNS: list[str] = [name for name, _, _ in COLUMN_DEFINITIONS]
 
+# 唯一键：``(交易日, vt_tradeid)``，幂等写入时作为冲突目标
+CONFLICT_COLUMNS: tuple[str, ...] = ("trade_date", "vt_tradeid")
+
+# 使用 ``%s`` 占位符的驱动；其余（sqlite/duckdb）用 ``?``
+PERCENT_PLACEHOLDER_DIALECTS: frozenset[str] = frozenset({"mysql", "postgresql"})
+
+SUPPORTED_DIALECTS: frozenset[str] = frozenset(
+    {"mysql", "postgresql", "sqlite", "duckdb"}
+)
+
 _LOCAL_TZ: ZoneInfo | None = None
+
+
+def normalize_dialect(driver_name: str | None) -> str:
+    """把 SqlApp 的 ``driver_name`` 归一成受支持的方言名
+
+    未知驱动按 ``mysql`` 处理（历史默认），保证旧环境行为不变。
+    """
+    dialect: str = (driver_name or "").strip().lower()
+    return dialect if dialect in SUPPORTED_DIALECTS else "mysql"
+
+
+def get_placeholder(dialect: str) -> str:
+    """参数占位符：mysql/postgresql 是 ``%s``，sqlite/duckdb 是 ``?``"""
+    return "%s" if dialect in PERCENT_PLACEHOLDER_DIALECTS else "?"
+
+
+def build_upsert_clause(dialect: str) -> str:
+    """幂等写入的冲突处理子句
+
+    重复键不产生实际修改，影响行数为 0，据此区分「新增」与「重复」。
+    """
+    if dialect == "mysql":
+        return "ON DUPLICATE KEY UPDATE id = id"
+
+    keys: str = ", ".join(f"`{name}`" for name in CONFLICT_COLUMNS)
+    if dialect == "duckdb":
+        return "ON CONFLICT DO NOTHING"
+    return f"ON CONFLICT ({keys}) DO NOTHING"
 
 
 def get_local_tz() -> ZoneInfo:
@@ -147,29 +188,104 @@ def trade_key(row: dict[str, Any]) -> tuple[str, str]:
     return (str(trade_date or ""), str(row.get("vt_tradeid") or ""))
 
 
-def build_create_table_sql(table_name: str) -> str:
-    """生成建表语句（与 ``script/create_vnpy_portfolio_trade.sql`` 保持一致）
+def build_create_table_statements(
+    table_name: str, dialect: str = "mysql"
+) -> list[str]:
+    """生成建表语句（mysql 与 ``script/create_vnpy_portfolio_trade.sql`` 保持一致）
 
-    ``table_name`` 是**未加引号**的原始表名，内部会做标识符校验。
+    ``table_name`` 是**未加引号**的原始表名，内部会做标识符校验。返回语句列表：
+    mysql 只有一条 ``CREATE TABLE``；duckdb/sqlite 没有 ``AUTO_INCREMENT``、
+    ``COMMENT``、``ENGINE`` 与 ``KEY`` 定义，改成自增主键 + 独立 ``CREATE INDEX``，
+    因此是多条；postgresql 用 ``IDENTITY`` 列。
     """
-    table_sql: str = validate_identifier(table_name, "表名")
+    raw_table: str = str(table_name)
+    table_sql: str = validate_identifier(raw_table, "表名")
+    dialect = normalize_dialect(dialect)
 
-    columns: str = ",\n".join(
-        f"    {validate_identifier(name, '列名')} {definition} COMMENT '{comment}'"
-        for name, definition, comment in COLUMN_DEFINITIONS
+    index_specs: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("date_reference", ("trade_date", "reference")),
+        ("symbol_date", ("vt_symbol", "trade_date")),
     )
 
-    return (
-        f"CREATE TABLE IF NOT EXISTS {table_sql} (\n"
-        "    `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',\n"
-        f"{columns},\n"
-        "    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',\n"
-        "    PRIMARY KEY (`id`),\n"
-        "    UNIQUE KEY `uk_trade_date_tradeid` (`trade_date`, `vt_tradeid`),\n"
-        "    KEY `idx_date_reference` (`trade_date`, `reference`),\n"
-        "    KEY `idx_symbol_date` (`vt_symbol`, `trade_date`)\n"
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='投资组合成交记录'"
-    )
+    def columns_sql(type_map: dict[str, str] | None = None, with_comment: bool = False) -> str:
+        parts: list[str] = []
+        for name, definition, comment in COLUMN_DEFINITIONS:
+            for source, target in (type_map or {}).items():
+                definition = definition.replace(source, target)
+            text: str = f"    {validate_identifier(name, '列名')} {definition}"
+            if with_comment:
+                text += f" COMMENT '{comment}'"
+            parts.append(text)
+        return ",\n".join(parts)
+
+    def index_statements() -> list[str]:
+        return [
+            f"CREATE INDEX IF NOT EXISTS "
+            f"{validate_identifier(f'{raw_table}_idx_{suffix}', '索引名')} "
+            f"ON {table_sql} ({', '.join(f'`{name}`' for name in columns)})"
+            for suffix, columns in index_specs
+        ]
+
+    if dialect == "duckdb":
+        # DuckDB 没有自增列：用序列做 ``id`` 默认值（与 MySQL AUTO_INCREMENT 等价）
+        raw_sequence: str = f"{raw_table}_id_seq"
+        return [
+            f"CREATE SEQUENCE IF NOT EXISTS {validate_identifier(raw_sequence, '序列名')} START 1",
+            (
+                f"CREATE TABLE IF NOT EXISTS {table_sql} (\n"
+                f"    `id` BIGINT PRIMARY KEY DEFAULT nextval('{raw_sequence}'),\n"
+                f"{columns_sql()},\n"
+                "    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n"
+                "    UNIQUE (`trade_date`, `vt_tradeid`)\n"
+                ")"
+            ),
+            *index_statements(),
+        ]
+
+    if dialect == "sqlite":
+        return [
+            (
+                f"CREATE TABLE IF NOT EXISTS {table_sql} (\n"
+                "    `id` INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+                f"{columns_sql()},\n"
+                "    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n"
+                "    UNIQUE (`trade_date`, `vt_tradeid`)\n"
+                ")"
+            ),
+            *index_statements(),
+        ]
+
+    if dialect == "postgresql":
+        type_map: dict[str, str] = {"DATETIME(3)": "TIMESTAMP(3)"}
+        return [
+            (
+                f"CREATE TABLE IF NOT EXISTS {table_sql} (\n"
+                "    `id` BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,\n"
+                f"{columns_sql(type_map)},\n"
+                "    `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n"
+                "    UNIQUE (`trade_date`, `vt_tradeid`)\n"
+                ")"
+            ),
+            *index_statements(),
+        ]
+
+    return [
+        (
+            f"CREATE TABLE IF NOT EXISTS {table_sql} (\n"
+            "    `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',\n"
+            f"{columns_sql(with_comment=True)},\n"
+            "    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',\n"
+            "    PRIMARY KEY (`id`),\n"
+            "    UNIQUE KEY `uk_trade_date_tradeid` (`trade_date`, `vt_tradeid`),\n"
+            "    KEY `idx_date_reference` (`trade_date`, `reference`),\n"
+            "    KEY `idx_symbol_date` (`vt_symbol`, `trade_date`)\n"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='投资组合成交记录'"
+        )
+    ]
+
+def build_create_table_sql(table_name: str, dialect: str = "mysql") -> str:
+    """建表语句的字符串形式（多条语句以 ``;`` 换行连接，便于查看/记录）"""
+    return ";\n".join(build_create_table_statements(table_name, dialect))
 
 
 class TradeRepository:
@@ -197,18 +313,29 @@ class TradeRepository:
 
         self.table: str = validate_identifier(self.table_name, "表名")
 
+        # 方言跟随 SqlApp 当前驱动（mysql/postgresql 用 %s，sqlite/duckdb 用 ?）
+        self.dialect: str = normalize_dialect(
+            getattr(getattr(sql_engine, "database", None), "driver_name", "")
+        )
+        self.placeholder: str = get_placeholder(self.dialect)
+
         # 拼好的列名列表，避免每次写入/查询重复拼接
         self.column_sql: str = ", ".join(
             validate_identifier(name, "列名") for name in TRADE_COLUMNS
         )
-        self.placeholder_sql: str = ", ".join("%s" for _ in TRADE_COLUMNS)
+        self.placeholder_sql: str = ", ".join(
+            self.placeholder for _ in TRADE_COLUMNS
+        )
 
     # -- 建表 -------------------------------------------------------------
 
     def ensure_table(self) -> bool:
         """建表（已存在则跳过）；失败返回 False，由调用方决定是否降级"""
         try:
-            self.sql_engine.execute(build_create_table_sql(self.table_name))
+            for statement in build_create_table_statements(
+                self.table_name, self.dialect
+            ):
+                self.sql_engine.execute(statement)
         except Exception as exc:  # noqa: BLE001 - 驱动异常类型由 SqlApp 包装
             self.log(f"创建成交记录表 {self.table} 失败：{exc}")
             return False
@@ -220,14 +347,15 @@ class TradeRepository:
         """写入一笔成交，返回是否**新增**了一行（重复键为 False）
 
         重启、CTP 登录重放当日成交、``replay_trades()`` 都会重复见到同一笔成交，
-        所以对重复键直接忽略（``ON DUPLICATE KEY UPDATE id = id`` 不产生实际修改，
-        影响行数为 0，据此就能区分新增与重复）。
+        所以对重复键直接忽略（mysql 的 ``ON DUPLICATE KEY UPDATE id = id``、
+        其余方言的 ``ON CONFLICT DO NOTHING`` 都不产生实际修改，影响行数为 0，
+        据此就能区分新增与重复）。
         用 ``INSERT IGNORE`` 也能去重，但它会把数据截断等错误一起吞掉，不好排查。
         """
         sql: str = (
             f"INSERT INTO {self.table} ({self.column_sql}) "
             f"VALUES ({self.placeholder_sql}) "
-            "ON DUPLICATE KEY UPDATE id = id"
+            f"{build_upsert_clause(self.dialect)}"
         )
         parameters: tuple[Any, ...] = tuple(row[name] for name in TRADE_COLUMNS)
 
@@ -243,8 +371,8 @@ class TradeRepository:
         """批量写入，返回**新增**的条数（重复的成交不计数）
 
         逐条执行而不是 ``executemany``：驱动侧的多行 INSERT 改写遇到
-        ``ON DUPLICATE KEY UPDATE`` 会退化成逐条执行甚至报错，收益不稳定；
-        单批数量很小（当日成交），逐条更可控，且一条失败不影响其余。
+        ``ON CONFLICT`` / ``ON DUPLICATE KEY UPDATE`` 会退化成逐条执行甚至报错，
+        收益不稳定；单批数量很小（当日成交），逐条更可控，且一条失败不影响其余。
         """
         count: int = 0
         for row in rows:
@@ -264,8 +392,8 @@ class TradeRepository:
                 continue
 
             sql: str = (
-                f"UPDATE {self.table} SET `name` = %s "
-                "WHERE `vt_symbol` = %s AND `name` = ''"
+                f"UPDATE {self.table} SET `name` = {self.placeholder} "
+                f"WHERE `vt_symbol` = {self.placeholder} AND `name` = ''"
             )
             try:
                 self.sql_engine.execute(sql, (name, vt_symbol))
@@ -292,15 +420,18 @@ class TradeRepository:
         """
         max_rows: int = self.settings.max_rows if limit is None else max(0, int(limit))
 
-        conditions: list[str] = ["`trade_date` >= %s", "`trade_date` <= %s"]
+        conditions: list[str] = [
+            f"`trade_date` >= {self.placeholder}",
+            f"`trade_date` <= {self.placeholder}",
+        ]
         parameters: list[Any] = [start_date, end_date]
 
         if reference:
-            conditions.append("`reference` = %s")
+            conditions.append(f"`reference` = {self.placeholder}")
             parameters.append(reference)
 
         if symbol:
-            conditions.append("`symbol` = %s")
+            conditions.append(f"`symbol` = {self.placeholder}")
             parameters.append(symbol)
 
         sql: str = (

@@ -92,16 +92,28 @@ class ContractResult:
         self.short_volume = 0
         self.long_cost = 0
         self.short_cost = 0
-    def calculate_pnl(self) -> None:
-        """"""
+    def calculate_pnl(self, prices: dict[str, tuple[float, float]] | None = None) -> None:
+        """计算盈亏
+
+        ``prices``: daily 模式按天算时，外部批量取好的日线收盘价，``{vt_symbol: (last_price, pre_close)}``。
+        为 None（realtime 模式）时走原路径 ``self.engine.get_tick`` 取实时 tick 的 last_price/pre_close。
+        两种取价源算的是同一套 trading_pnl/holding_pnl/total_pnl，只是价格时刻不同（实时 vs 收盘）。
+        """
         vt_symbol: str = self.vt_symbol
 
         contract: ContractData | None = self.engine.get_contract(vt_symbol)
-        tick: TickData | None = self.engine.get_tick(vt_symbol)
-        if not contract or not tick:
-            return
-
-        last_price: float = tick.last_price
+        if prices is not None:
+            pair: tuple[float, float] | None = prices.get(vt_symbol)
+            if not contract or pair is None:
+                return
+            last_price: float = pair[0]
+            pre_close: float = pair[1]
+        else:
+            tick: TickData | None = self.engine.get_tick(vt_symbol)
+            if not contract or not tick:
+                return
+            last_price = tick.last_price
+            pre_close = tick.pre_close
         size: float = contract.size
 
         # 计算新成交额
@@ -129,10 +141,11 @@ class ContractResult:
 
         # 计算未实现利润和总利润
         #
-        # 基准用 tick.pre_close（昨收盘）：vnpy 的 TickData 没有昨结算价字段，
+        # 基准用 pre_close（昨收盘）：vnpy 的 TickData 没有昨结算价字段，
         # vnpy_ctp 也只映射了 PreClosePrice，而国内期货盯市应以昨结算价为基准，
         # 因此期货的持仓盈亏会有（昨结算-昨收）*持仓*乘数 的偏差，无数据源可修。
-        self.holding_pnl = (last_price - tick.pre_close) * self.open_pos * size
+        # daily 模式下 pre_close 取自日线 preClose（同口径）。
+        self.holding_pnl = (last_price - pre_close) * self.open_pos * size
         self.total_pnl = self.holding_pnl + self.trading_pnl
 
     def get_data(self) -> dict:

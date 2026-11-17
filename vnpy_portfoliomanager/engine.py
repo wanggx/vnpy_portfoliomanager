@@ -94,6 +94,10 @@ class PortfolioEngine(BaseEngine):
 
         self.timer_count: int = 0
         self.timer_interval: int = 5
+        # 盈亏计算模式："realtime"（默认，订阅 tick 每 timer 周期算）或 "daily"
+        # （收盘后/日切时用日线收盘价算一次，不订阅 tick，绕过订阅链路的同步阻塞）。
+        # 见 docs/... 与 plan：daily 模式去掉 subscribe_symbol，盈亏按天滚动。
+        self.pnl_mode: str = "realtime"
 
         self.load_setting()
         self.load_order()
@@ -174,6 +178,12 @@ class PortfolioEngine(BaseEngine):
 
         contract_result.update_trade(trade)
 
+        # daily 模式：成交后顺带推一次持仓明细（仓位已变），让持仓树刷新仓位列。
+        # 盈亏列此时是上次日级值或 0（收盘/日切才算），界面照常显示仓位变化。
+        # realtime 模式靠 5s timer 的 EVENT_PM_CONTRACT 刷新，不需要这里推。
+        if self.pnl_mode == "daily":
+            self.event_engine.put(Event(EVENT_PM_CONTRACT, contract_result.get_data()))
+
         # 落库：失败只记日志，不影响内存记账（仓位与盈亏仍以内存为准）
         trade.reference = reference
         row: dict[str, Any] = self.make_trade_row(trade, reference)
@@ -193,7 +203,10 @@ class PortfolioEngine(BaseEngine):
         # 有持仓的合约才需要订阅tick数据
         if self.has_position(vt_symbol):
             self.result_symbols.add(vt_symbol)
-            self.subscribe_symbol(vt_symbol)
+            # daily 模式不订阅 tick（盈亏按天用日线收盘价算，绕过订阅链路的同步阻塞）；
+            # realtime 模式才订阅。result_symbols 仍维护（标识有持仓的标的）。
+            if self.pnl_mode == "realtime":
+                self.subscribe_symbol(vt_symbol)
         else:
             self.result_symbols.discard(vt_symbol)
 
@@ -206,6 +219,12 @@ class PortfolioEngine(BaseEngine):
 
         # 跨交易日时归档前一日结果并滚动仓位
         self.check_date_change()
+
+        # daily 模式：不算实时盈亏、不发周期 PM 事件（盈亏在 check_date_change 日切时
+        # 按“收盘后算一次”触发）。这里只保留落盘。
+        if self.pnl_mode == "daily":
+            self.save_history_periodically()
+            return
 
         for portfolio_result in self.portfolio_results.values():
             portfolio_result.clear_pnl()
@@ -245,7 +264,9 @@ class PortfolioEngine(BaseEngine):
         if contract.vt_symbol not in self.result_symbols:
             return
 
-        self.subscribe_symbol(contract.vt_symbol)
+        # daily 模式不订阅 tick（盈亏按天算，无需实时行情）。
+        if self.pnl_mode == "realtime":
+            self.subscribe_symbol(contract.vt_symbol)
 
     def subscribe_symbol(self, vt_symbol: str) -> None:
         """订阅合约行情，自动去重"""
@@ -473,6 +494,13 @@ class PortfolioEngine(BaseEngine):
             )
 
         if date_changed:
+            # daily 模式 + 进程收盘后关闭：次日重启时上一日盈亏没归档（check_date_change
+            # 没跑到）。这里用旧日期的日线收盘价补算一次并归档，曲线才有上一日的点。
+            # realtime 模式不补：它的盈亏靠盘中 timer 算 + 关闭前 save_history，跨日只滚仓位。
+            if self.pnl_mode == "daily":
+                prev_date = date
+                self._calculate_daily_pnl(date_str=prev_date)
+                self.record_daily_result(prev_date)
             self.save_data()
         else:
             # 当日重启：不回放的话，当日成交盈亏会从0重算，曲线偏低
@@ -515,8 +543,10 @@ class PortfolioEngine(BaseEngine):
         }
 
         # 合约信息可能还没加载，稍后由合约事件（process_contract_event）再订阅
-        for vt_symbol in self.result_symbols:
-            self.subscribe_symbol(vt_symbol)
+        # daily 模式不订阅 tick（盈亏按天算，无需实时行情）。
+        if self.pnl_mode == "realtime":
+            for vt_symbol in self.result_symbols:
+                self.subscribe_symbol(vt_symbol)
 
     def save_data(self) -> None:
         """"""
@@ -544,6 +574,9 @@ class PortfolioEngine(BaseEngine):
             self.timer_interval = setting["timer_interval"]
         if "capitals" in setting:
             self.capitals = {key: float(value) for key, value in setting["capitals"].items()}
+        mode = str(setting.get("pnl_mode", "realtime")).strip().lower()
+        if mode in ("realtime", "daily"):
+            self.pnl_mode = mode
 
         self.sql_settings = parse_sql_settings(setting)
 
@@ -556,6 +589,7 @@ class PortfolioEngine(BaseEngine):
         setting: dict[str, Any] = load_json(self.setting_filename)
         setting["timer_interval"] = self.timer_interval
         setting["capitals"] = self.capitals
+        setting["pnl_mode"] = self.pnl_mode
         save_json(self.setting_filename, setting)
 
     def set_capital(self, reference: str, capital: float) -> None:
@@ -664,15 +698,137 @@ class PortfolioEngine(BaseEngine):
         }
         return data
 
+    def _fetch_daily_prices(self, vt_symbols: set[str], date_str: str = "") -> dict[str, tuple[float, float]]:
+        """批量取日线收盘价，返回 {vt_symbol: (last_price, pre_close)}。
+
+        ``date_str`` 为空时取最近一根（收盘后/日切时用当日收盘价）；指定日期时取
+        那一天的收盘价（次日重启补算上一日盈亏用），pre_close 取前一日的 close。
+        走 bigqmt 的 xtdata.get_market_data_ex（与 vnpy_xt/xt_datafeed 同一个 xtdata），
+        一次 RPC 批量取所有标的，避免逐标的往返。
+
+        vt_symbol 与 xt_symbol 在股票/ETF 上同形（600000.SH）；期权沪市需 SHO/SZO
+        后缀（参照 vnpy_xt 的 XtMdApi.subscribe 规则）。
+        """
+        if not vt_symbols:
+            return {}
+        try:
+            from bigqmt_signal_trader.xtquant_compat import xtdata
+        except Exception as exc:
+            self.write_log_once("daily 盈亏取价失败：无法导入 bigqmt xtdata（%s）" % exc)
+            return {}
+
+        # vt_symbol -> xt_symbol（仅期权沪/深市加 O 后缀）
+        xt_symbols: list[str] = []
+        vt_to_xt: dict[str, str] = {}
+        for vt_symbol in vt_symbols:
+            if "." not in vt_symbol:
+                continue
+            symbol, suffix = vt_symbol.split(".", 1)
+            xt_suffix = suffix
+            if suffix in ("SH", "SZ") and len(symbol) > 6:
+                xt_suffix = suffix + "O"
+            xt_symbol = symbol + "." + xt_suffix
+            xt_symbols.append(xt_symbol)
+            vt_to_xt[vt_symbol] = xt_symbol
+
+        if not xt_symbols:
+            return {}
+
+        # count=2：最后一根的 close 当 last_price，前一根的 close 当 pre_close（昨收）。
+        # 指定 date_str 时取该日及之前，保证次日重启能补到上一日。
+        start_time = end_time = ""
+        if date_str:
+            start_time = end_time = date_str.replace("-", "")
+        try:
+            data = xtdata.get_market_data_ex(
+                field_list=[],
+                stock_list=xt_symbols,
+                period="1d",
+                start_time=start_time,
+                end_time=end_time,
+                count=2,
+                dividend_type="none",
+                fill_data=False,
+            ) or {}
+        except Exception as exc:
+            self.write_log_once("daily 盈亏取价失败：get_market_data_ex 异常（%s）" % exc)
+            return {}
+
+        prices: dict[str, tuple[float, float]] = {}
+        for vt_symbol, xt_symbol in vt_to_xt.items():
+            frame = None
+            if isinstance(data, dict):
+                frame = data.get(xt_symbol)
+                if frame is None:
+                    for key, value in data.items():
+                        if str(key).upper() == xt_symbol.upper():
+                            frame = value
+                            break
+            if frame is None or not hasattr(frame, "shape") or frame.shape[0] == 0:
+                continue
+            try:
+                closes = list(frame["close"])
+                last_price = float(closes[-1])
+                pre_close = float(closes[-2]) if len(closes) >= 2 else last_price
+                prices[vt_symbol] = (last_price, pre_close)
+            except Exception:
+                continue
+        return prices
+
+    def _calculate_daily_pnl(self, date_str: str = "") -> None:
+        """按天算一次盈亏（daily 模式）：用日线收盘价批量取价，算各合约与组合盈亏，
+        置 pnl_computed，发 PM 事件刷新界面。
+
+        ``date_str`` 为空算“当日”（收盘后/日切时），指定日期算那一天（次日重启补算）。
+        算完发 EVENT_PM_CONTRACT/PORTFOLIO/HISTORY 让界面（持仓树盈亏列、曲线）刷新一次。
+        """
+        vt_symbols = {
+            contract_result.vt_symbol
+            for contract_result in self.contract_results.values()
+            if contract_result.last_pos
+        }
+        prices = self._fetch_daily_prices(vt_symbols, date_str)
+
+        for portfolio_result in self.portfolio_results.values():
+            portfolio_result.clear_pnl()
+
+        for contract_result in self.contract_results.values():
+            contract_result.calculate_pnl(prices=prices)
+
+            portfolio_result = self.get_portfolio_result(contract_result.reference)
+            portfolio_result.trading_pnl += contract_result.trading_pnl
+            portfolio_result.holding_pnl += contract_result.holding_pnl
+            portfolio_result.total_pnl += contract_result.total_pnl
+
+            event = Event(EVENT_PM_CONTRACT, contract_result.get_data())
+            self.event_engine.put(event)
+
+        self.pnl_computed = True
+
+        for portfolio_result in self.portfolio_results.values():
+            event = Event(EVENT_PM_PORTFOLIO, portfolio_result.get_data())
+            self.event_engine.put(event)
+
+        event = Event(EVENT_PM_HISTORY, self.get_history_data())
+        self.event_engine.put(event)
+
     def check_date_change(self) -> None:
         """检测交易日切换：归档前一日结果，滚动收盘仓位，并清理已平仓的合约
 
         交易日按自然日（遇周末顺延），本地以 A 股为主、没有夜盘，所以不再把 20:00
         之后算作下一个交易日。
+
+        daily 模式：归档前先按天算一次当日盈亏（用日线收盘价），否则 record_daily_result
+        会把没算过的当日写成 0。
         """
         today: str = get_trading_day()
         if today == self.current_date:
             return
+
+        # daily 模式：收盘后用当日（旧 current_date）日线收盘价算一次盈亏再归档。
+        # realtime 模式：盈亏已由 process_timer_event 每 5s 算好，无需此处再算。
+        if self.pnl_mode == "daily":
+            self._calculate_daily_pnl(date_str=self.current_date)
 
         self.record_daily_result(self.current_date)
         self.current_date = today
